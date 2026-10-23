@@ -1,0 +1,7 @@
+/target
+
+# Ignore everything in espectre_data
+/espectre_data/*
+
+# Except .npz files
+!/espectre_data/*.npz

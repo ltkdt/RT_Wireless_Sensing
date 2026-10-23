@@ -1,0 +1,9 @@
+[package]
+name = "rt-wireless-sensing"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ndarray = "0.17.2"
+ndarray-npy = "0.10.0"
+rustfft = "6.4.1"
