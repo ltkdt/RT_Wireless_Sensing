@@ -1,50 +1,102 @@
-use std::{env, error::Error, path::Path};
+/*
+ * Open the ESPectre CSI HTTP stream and save its raw binary data.
+ *
+ * - GET /csi opens an HTTP response stream containing CSI data in V8 format.
+ * - bytes_stream() reads the response body incrementally, one chunk at a time,
+ *   avoiding the need to buffer the entire stream in memory.
+ * - Each chunk is written directly to capture_v8.bin in the current working
+ *   directory. If the file already exists, it is overwritten.
+ * - `total` tracks the cumulative number of bytes written to the file.
+ * - Stream chunks are not guaranteed to align with CSI record boundaries.
+ *   A dedicated V8 parser is required to decode individual CSI records.
+ * - The file contains raw binary data; no CSI decoding, DSP, or AI inference
+ *   is performed here.
+ * - Ensure ESPectre sensing is running and the traffic generator is configured
+ *   appropriately before opening the stream.
+ *
+ * References:
+ * https://github.com/francescopace/espectre/blob/main/docs/API.md?utm_source=chatgpt.com#csi-collection
+ * https://github.com/francescopace/espectre/blob/main/docs/API.md?utm_source=chatgpt.com
+ * https://github.com/francescopace/espectre/blob/main/docs/CSI.md?utm_source=chatgpt.com
+ */
 
-mod dsp;
-use dsp::{amplitude, fft_peaks, load_csi, load_ticks, mean_std};
 
+use std::{error::Error, net::SocketAddr, sync::Arc};
+use futures_util::StreamExt;
+use reqwest::Client;
+use tokio::{
+    io::AsyncWriteExt,
+    net::UdpSocket,
+    time::{interval, sleep, Duration},
+};
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = env::args().collect();
-    let dir = Path::new(args.get(1).map(String::as_str).unwrap_or("espectre_data/free_space.npz_FILES"));
-    let sc: usize = args.get(2).map_or(Ok(0), |s| s.parse())?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let ip : &str = "10.178.22.9"; // ESP32 IP 
+    let base : String = format!("http://{ip}:62587/espectre/v1"); // Espectre endpoint 
+    let origin: &str = "https://test.espectre.dev";
+    let client : Client = Client::new(); // HTTP Client provided by reqwest
+    let pps : u64 = 20;
+    let packet_duration = Duration::from_millis(1000 / pps);
 
-    let csi = load_csi(&dir.join("csi_data.npy"))?;
-    let ticks = load_ticks(&dir.join("device_ticks_us.npy"))?;
-    let amp = amplitude(&csi);
+    // 1. Check CSI capability
+    let caps = client
+        .get(format!("{base}/capabilities"))
+        .header("Origin", origin)
+        .send().await?
+        .error_for_status()?
+        .text().await?;
+    println!("Capabilities: {caps}");
 
-    let (n, nsc) = amp.dim();
-    assert!(n >= 4 && sc < nsc && ticks.len() == n);
+    // 2. Enable external traffic mode
+    let result = client
+        .patch(format!("{base}/sensing"))       // PATCH request to enable external traffic mode
+        .header("Origin", origin)
+        .json(&serde_json::json!({
+            "traffic_generator_mode": "external"
+        }))
+        .send().await?
+        .error_for_status()?
+        .text().await?;
+    println!("Sensing: {result}");
 
-    let mut dt: Vec<f64> = ticks.windows(2).into_iter()
-        .map(|w| (w[1] as f64 - w[0] as f64) / 1e6)
-        .collect();
+    // 3. Send UDP markers at 20 PPS
+    // bind to a random port on all interfaces, and send UDP packets to the ESP32 at 20 PPS
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:0").await?); // Arc: multiple threads can share the same socket
+    let sender = socket.clone(); // In the future, there can be more task that use the same socket. Currently, we only have one task that sends UDP packets.
+    let target: SocketAddr = format!("{ip}:5555").parse()?;
 
-    assert!(dt.iter().all(|&v| v > 0.0), "Invalid timestamps");
-    dt.sort_by(f64::total_cmp);
-    let fs = 1.0 / dt[dt.len() / 2];
+    tokio::spawn(async move {
+        let marker = [0xF0, 0x9F, 0x91, 0xBB]; // Espectre 
+        let mut timer = interval(packet_duration);
 
-    println!("Packets:     {n}");
-    println!("Subcarriers: {nsc}");
-    println!("Sample rate: {fs:.2} Hz (median interval)");
+        loop {
+            timer.tick().await; // `PPS` markers per second
+            if let Err(e) = sender.send_to(&marker, target).await {
+                eprintln!("UDP error: {e}");
+                break;
+            }
+        }
+    });
 
-    let all: Vec<f64> = amp.iter().copied().collect();
-    let (mean, std) = mean_std(&all);
-    println!("\nGlobal amplitude: mean={mean:.3}, std={std:.3}");
+    sleep(Duration::from_millis(200)).await; // Wait for the ESP32 to start sending CSI packets
 
-    println!("\n{:<12} {:>12} {:>12}", "Subcarrier", "Mean", "Std");
-    for k in 0..nsc {
-        let x = amp.column(k).to_vec();
-        let (mean, std) = mean_std(&x);
-        println!("{k:<12} {mean:>12.3} {std:>12.3}");
-    }
+    // 4. Open the raw CSI stream
+    let response = client
+        .get(format!("{base}/csi"))
+        .header("Origin", origin)
+        .send().await?
+        .error_for_status()?;
 
-    let signal = amp.column(sc).to_vec();
-    println!("\nTop FFT bins - SC {sc}:");
-    println!("{:<16} {}", "Frequency (Hz)", "Magnitude (a.u.)");
+    let mut stream = response.bytes_stream();
+    let mut file = tokio::fs::File::create("capture_v8.bin").await?; // Create a file to store the raw binary file 
+    let mut total = 0u64;
 
-    for (freq, mag) in fft_peaks(&signal, fs) {
-        println!("{freq:<16.3} {mag:.5}");
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
+        total += chunk.len() as u64;
+        println!("Received {total} bytes");
     }
 
     Ok(())
