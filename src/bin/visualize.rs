@@ -9,11 +9,7 @@
 //! cargo run --bin visualize -- capture_v8.bin --serve --port 8080
 //! ```
 
-use std::{
-    env,
-    path::PathBuf,
-    process::ExitCode,
-};
+use std::{env, path::PathBuf, process::ExitCode};
 
 use rt_wireless_sensing::visualization::{VisualizationData, serve_dashboard};
 
@@ -75,7 +71,10 @@ async fn main() -> ExitCode {
     let data = match VisualizationData::from_file(&options.input) {
         Ok(data) => data,
         Err(err) => {
-            eprintln!("error: failed to load and decode '{}': {err}", options.input.display());
+            eprintln!(
+                "error: failed to load and decode '{}': {err}",
+                options.input.display()
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -87,7 +86,10 @@ async fn main() -> ExitCode {
     // Export JSON if requested
     if let Some(json_path) = &options.json_output {
         if let Err(err) = data.export_json(json_path) {
-            eprintln!("error: failed to export JSON to '{}': {err}", json_path.display());
+            eprintln!(
+                "error: failed to export JSON to '{}': {err}",
+                json_path.display()
+            );
             return ExitCode::FAILURE;
         }
         if !options.quiet {
@@ -97,13 +99,20 @@ async fn main() -> ExitCode {
 
     // Determine HTML output path
     let html_path = options.output.unwrap_or_else(|| {
-        let stem = options.input.file_stem().and_then(|s| s.to_str()).unwrap_or("csi");
+        let stem = options
+            .input
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("csi");
         PathBuf::from(format!("{stem}_heatmap.html"))
     });
 
     // Always export the standalone HTML bundle
     if let Err(err) = data.export_html(&html_path) {
-        eprintln!("error: failed to export HTML dashboard to '{}': {err}", html_path.display());
+        eprintln!(
+            "error: failed to export HTML dashboard to '{}': {err}",
+            html_path.display()
+        );
         return ExitCode::FAILURE;
     }
     if !options.quiet {
@@ -149,17 +158,25 @@ where
         match arg.as_str() {
             "-h" | "--help" => return Ok(ParsedArgs::Help),
             "-o" | "--output" => {
-                let val = args.next().ok_or_else(|| "--output requires a path".to_string())?;
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--output requires a path".to_string())?;
                 output = Some(PathBuf::from(val));
             }
             "--json" => {
-                let val = args.next().ok_or_else(|| "--json requires a path".to_string())?;
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--json requires a path".to_string())?;
                 json_output = Some(PathBuf::from(val));
             }
             "--serve" => serve = true,
             "--port" => {
-                let val = args.next().ok_or_else(|| "--port requires a number".to_string())?;
-                port = val.parse::<u16>().map_err(|_| format!("invalid port: {val}"))?;
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--port requires a number".to_string())?;
+                port = val
+                    .parse::<u16>()
+                    .map_err(|_| format!("invalid port: {val}"))?;
             }
             "--open" => open = true,
             "-q" | "--quiet" => quiet = true,
@@ -188,7 +205,10 @@ where
 
 fn print_summary(data: &VisualizationData) {
     let m = &data.metadata;
-    println!("source       : {}", m.source.as_deref().unwrap_or("<in-memory>"));
+    println!(
+        "source       : {}",
+        m.source.as_deref().unwrap_or("<in-memory>")
+    );
     println!("records      : {}", m.total_frames);
     println!("subcarriers  : {}", m.subcarriers);
     println!("start clock  : {} µs", m.start_time_us);
@@ -236,14 +256,7 @@ mod tests {
     #[test]
     fn accepts_flags() {
         let ParsedArgs::Run(options) = parse(&[
-            "run.bin",
-            "--output",
-            "out.html",
-            "--serve",
-            "--port",
-            "9090",
-            "--open",
-            "--quiet",
+            "run.bin", "--output", "out.html", "--serve", "--port", "9090", "--open", "--quiet",
         ])
         .unwrap() else {
             panic!("expected a run");

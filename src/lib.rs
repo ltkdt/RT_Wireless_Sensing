@@ -11,6 +11,8 @@
 //!   phase arrays to a `.npz` archive.
 //! * [`visualization`] — prepare decoded CSI records and render an interactive
 //!   2D amplitude heatmap web dashboard.
+//! * [`streaming`] — collect, decode live, and serve a sliding-window
+//!   heatmap dashboard at the same time.
 //!
 //! [`csi_header`] holds the record schema used by the decoder.
 //!
@@ -21,4 +23,5 @@ pub mod collection;
 pub mod csi_header;
 pub mod decoder;
 pub mod saving;
+pub mod streaming;
 pub mod visualization;

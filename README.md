@@ -13,11 +13,13 @@ Currently this is used for Wi-Fi CSI sensing.
   - `saving.rs` — decodes a capture and exports timestamp, amplitude, and phase
     arrays to `.npz`.
   - `visualization.rs` — prepares decoded CSI data for 2D amplitude heatmap rendering.
+  - `streaming.rs` — collects and decodes CSI while serving a live 30 s sliding
+    heatmap dashboard.
   - `csi_header.rs` — the 64-byte V8 record schema used by the decoder.
   - `main.rs` — default binary; runs the collection module with its default
     settings.
-  - `bin/collect.rs`, `bin/decode.rs`, `bin/save.rs`, `bin/visualize.rs` — standalone
-    CLIs for each module.
+  - `bin/collect.rs`, `bin/decode.rs`, `bin/save.rs`, `bin/visualize.rs`,
+    `bin/streaming.rs` — standalone CLIs for each module.
 - **Web** (`web/`): HTML5, CSS3, and Vanilla JavaScript with HTML Canvas 2D for
   interactive heatmap rendering.
 - **Python** (`scripts/`): creates plots and performs statistics to validate
@@ -32,6 +34,7 @@ Currently this is used for Wi-Fi CSI sensing.
 | **Decoder** | `src/decoder.rs` | Incrementally parses the 60-byte HTTP prefix and 64-byte V8 CSI header, validates counters, and exposes raw I/Q plus amplitude/phase. | [docs/decoder.md](docs/decoder.md) | `cargo run --bin decode -- capture_v8.bin` |
 | **Saving** | `src/saving.rs` | Decodes a collected `.bin` and writes a same-stem `.npz` with 1 timestamp + 64 amplitude + 64 phase arrays (129 total for 64 subcarriers). | [docs/saving.md](docs/saving.md) | `cargo run --bin save -- capture_v8.bin` |
 | **Visualization** | `src/visualization.rs` | Renders a 2D CSI amplitude heatmap dashboard via HTML Canvas 2D, exportable as standalone HTML or served over HTTP. | [docs/visualization.md](docs/visualization.md) | `cargo run --bin visualize -- capture_v8.bin` |
+| **Streaming** | `src/streaming.rs` | Collects and decodes CSI live, serving a 30 s sliding heatmap with a 3 s warm-up, 500 ms refresh, and click-to-compute occupancy. | [docs/streaming.md](docs/streaming.md) | `cargo run --bin streaming -- --help` |
 
 The shared V8 record schema is in `src/csi_header.rs` and is documented with the
 decoder.
@@ -50,15 +53,19 @@ decoder.
    `timestamp_ms`, `amplitude_00..63`, and `phase_00..63`. Timestamps are in
    milliseconds and start at 0, using the device's monotonic sample clock
    (`device_ticks_us`).
-5. Downstream work (web amplitude heatmap, ONNX inference for localization) can
-   consume the decoded packets or the `.npz` arrays. The AI pipeline is not
-   implemented yet.
+5. The **streaming** command composes collection, live decoding, and
+   visualization in one process: it writes the raw `.bin`, starts the dashboard
+   immediately, waits 3 seconds, then refreshes a 30-second sliding heatmap
+   every 500 ms. Clicking a point reports the occupancy of that second:
+   `N_filled / N` slots, where `N` is the configured PPS.
+6. Downstream work (ONNX inference for localization) can consume the decoded
+   packets or the `.npz` arrays. The AI pipeline is not implemented yet.
 
 ## Quick start
 
 ```bash
 # Record with the default device and output (same as `cargo run`)
-cargo run --bin collect -- --ip 10.178.22.9 --output capture_v8.bin
+cargo run --bin collect -- --ip 10.178.22.9 --output capture_v8.bin --pps 100
 
 # Inspect the capture (optional)
 cargo run --bin decode -- capture_v8.bin --quiet
@@ -69,12 +76,18 @@ cargo run --bin save -- capture_v8.bin
 # Visualize 2D amplitude heatmap (generates standalone capture_v8_heatmap.html)
 cargo run --bin visualize -- capture_v8.bin --open
 
+# Collect and visualize live at the same time (open http://127.0.0.1:8080)
+cargo run --bin streaming -- --ip 10.178.22.9 --output capture_v8.bin --pps 100 --port 8080
+
 # Load the result in Python
 python3 -c 'import numpy as np; d=np.load("capture_v8.npz"); print(len(d.files), d["timestamp_ms"].shape)'
 ```
 
 The repository's `capture_v8.bin` decodes to 691 records and produces
 `129` arrays of length `691`.
+
+An example of the Web UI interface during streaming:
+![plot_ui](/plot_data/example_UI.png)
 
 ## Documentation
 
@@ -83,6 +96,7 @@ The repository's `capture_v8.bin` decodes to 691 records and produces
 - [Decoder module](docs/decoder.md)
 - [Saving module](docs/saving.md)
 - [Visualization module](docs/visualization.md)
+- [Streaming module](docs/streaming.md)
 
 API documentation is also available from rustdoc:
 
@@ -99,3 +113,4 @@ cargo clippy --all-targets
 
 The integration tests decode the real `capture_v8.bin` (691 frames, payload
 hash `0x6446fc78e2c7f3e6`) and verify the exported `.npz` layout and values.
+

@@ -83,6 +83,7 @@ class CsiVisualizer {
         this.minAmp = 0;
         this.maxAmp = 100;
         this.hoverState = null;
+        this.occupancy = null;
         this.offscreenCanvas = document.createElement('canvas');
         this.offscreenCtx = this.offscreenCanvas.getContext('2d');
 
@@ -101,6 +102,7 @@ class CsiVisualizer {
         this.data = data;
         this.calculateBounds();
         this.updateMetadataUI();
+        this.refreshOccupancy();
         this.render();
     }
 
@@ -124,6 +126,88 @@ class CsiVisualizer {
         // Clamp reasonable defaults
         this.minAmp = min;
         this.maxAmp = max > min ? max : min + 1.0;
+    }
+
+    // Nominal packets-per-second used to divide a one-second interval into
+    // occupancy slots. The streaming command sets this to --pps; static
+    // captures fall back to the measured effective rate.
+    getNominalPps() {
+        const meta = this.data && this.data.metadata;
+        const configured = meta && Number.isFinite(meta.nominal_pps) ? meta.nominal_pps : 0;
+        const measured = meta && Number.isFinite(meta.effective_pps) ? meta.effective_pps : 0;
+        const pps = Math.round(configured > 0 ? configured : measured);
+        return Math.max(1, Math.min(pps || 1, 100000));
+    }
+
+    // Occupancy for the second [secondStart, secondStart + 1):
+    // divide the second into N = nominal PPS slots and report the fraction of
+    // slots that contain at least one measurement.
+    computeOccupancy(secondStart) {
+        if (!this.data || !Array.isArray(this.data.timestamps) || this.data.timestamps.length === 0) {
+            return null;
+        }
+        if (!Number.isFinite(secondStart)) return null;
+
+        const slots = this.getNominalPps();
+        const filled = new Uint8Array(slots);
+        const secondsEnd = secondStart + 1;
+        let measurements = 0;
+
+        for (let i = 0; i < this.data.timestamps.length; i++) {
+            const t = this.data.timestamps[i];
+            if (t >= secondStart && t < secondsEnd) {
+                measurements++;
+                // Add a tiny epsilon so exact slot boundaries (for example
+                // 24.13 s with 100 slots) are not pushed into the previous
+                // slot by binary floating-point rounding.
+                let slot = Math.floor((t - secondStart) * slots + 1e-6);
+                if (slot < 0) slot = 0;
+                if (slot >= slots) slot = slots - 1;
+                filled[slot] = 1;
+            }
+        }
+
+        let filledCount = 0;
+        for (let i = 0; i < slots; i++) filledCount += filled[i];
+
+        return {
+            secondStart,
+            slots,
+            filled: filledCount,
+            measurements,
+            occupancy: filledCount / slots
+        };
+    }
+
+    updateOccupancyUI() {
+        const el = document.getElementById('hoverOccupancy');
+        if (!el) return;
+        if (!this.occupancy) {
+            el.textContent = '--';
+            return;
+        }
+        const o = this.occupancy;
+        el.textContent = `${(o.occupancy * 100).toFixed(1)}% (${o.filled}/${o.slots} @ ${o.secondStart}s)`;
+    }
+
+    // Recompute the selected second after a live data refresh, and drop it once
+    // the sliding 30-second window no longer contains that second.
+    refreshOccupancy() {
+        if (!this.occupancy || !this.data || !Array.isArray(this.data.timestamps) || this.data.timestamps.length === 0) {
+            this.updateOccupancyUI();
+            return;
+        }
+
+        const secondStart = this.occupancy.secondStart;
+        const first = this.data.timestamps[0];
+        const last = this.data.timestamps[this.data.timestamps.length - 1];
+
+        if (secondStart + 1 <= first || secondStart > last) {
+            this.occupancy = null;
+        } else {
+            this.occupancy = this.computeOccupancy(secondStart);
+        }
+        this.updateOccupancyUI();
     }
 
     updateMetadataUI() {
@@ -263,7 +347,11 @@ class CsiVisualizer {
 
     drawAxes(px, py, pw, ph) {
         const timestamps = this.data.timestamps || [];
-        const totalDuration = this.data.metadata.duration_seconds || (timestamps.length ? timestamps[timestamps.length - 1] : 0);
+        const tMin = timestamps.length ? timestamps[0] : 0;
+        const tMax = timestamps.length
+            ? timestamps[timestamps.length - 1]
+            : (this.data.metadata.duration_seconds || 0);
+        const timeSpan = Math.max(tMax - tMin, 1e-9);
         const subcarrierCount = this.data.metadata.subcarriers || 64;
 
         this.ctx.fillStyle = '#94a3b8';
@@ -275,7 +363,7 @@ class CsiVisualizer {
 
         // Compute sensible time step
         const approxTicks = 8;
-        const rawStep = totalDuration / approxTicks;
+        const rawStep = timeSpan / approxTicks;
         const niceSteps = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 20, 30];
         let step = niceSteps[niceSteps.length - 1];
         for (const s of niceSteps) {
@@ -288,9 +376,13 @@ class CsiVisualizer {
         this.ctx.strokeStyle = '#1e293b';
         this.ctx.lineWidth = 1;
 
-        for (let t = 0; t <= totalDuration + 1e-6; t += step) {
-            const frac = totalDuration > 0 ? t / totalDuration : 0;
-            if (frac > 1.001) break;
+        // Keep labels at their absolute elapsed times, so a sliding window at
+        // 32 s shows 2..32 instead of resetting to 0 on every refresh.
+        const tickCount = Math.max(1, Math.floor(timeSpan / step + 1e-9));
+        for (let i = 0; i <= tickCount; i++) {
+            const t = tMin + i * step;
+            if (t > tMax + 1e-6) break;
+            const frac = (t - tMin) / timeSpan;
             const x = px + frac * pw;
 
             // Tick mark
@@ -310,7 +402,7 @@ class CsiVisualizer {
             }
 
             // Label
-            this.ctx.fillText(`${t.toFixed(t < 1 && step < 1 ? 1 : 0)}`, x, py + ph + 8);
+            this.ctx.fillText(`${t.toFixed(step < 1 ? 1 : 0)}`, x, py + ph + 8);
         }
 
         // X-Axis Label
@@ -446,58 +538,95 @@ class CsiVisualizer {
         this.ctx.restore();
     }
 
-    initEvents() {
+    eventToPoint(e) {
+        if (!this.data || !this.plotBounds || !this.data.amplitudes || this.data.amplitudes.length === 0) {
+            return null;
+        }
+
+        const rect = this.canvas.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+        const { x: px, y: py, w: pw, h: ph } = this.plotBounds;
+
+        if (mouseX < px || mouseX > px + pw || mouseY < py || mouseY > py + ph) {
+            return null;
+        }
+
+        const numFrames = this.data.amplitudes.length;
+        const numSubcarriers = this.data.metadata.subcarriers
+            || (this.data.amplitudes[0] ? this.data.amplitudes[0].length : 64);
+
+        const fracX = (mouseX - px) / pw;
+        const fracY = (mouseY - py) / ph;
+        const frameIdx = Math.min(numFrames - 1, Math.max(0, Math.floor(fracX * numFrames)));
+        // Inverted Y: bottom is 0, top is numSubcarriers - 1
+        const scIdx = Math.min(numSubcarriers - 1, Math.max(0, Math.floor((1 - fracY) * numSubcarriers)));
+
+        const timeSec = this.data.timestamps && this.data.timestamps[frameIdx] !== undefined
+            ? this.data.timestamps[frameIdx]
+            : (frameIdx / numFrames) * this.data.metadata.duration_seconds;
+        const ampVal = this.data.amplitudes[frameIdx][scIdx];
+
+        return {
+            mouseX,
+            mouseY,
+            clientX: e.clientX,
+            clientY: e.clientY,
+            frameIdx,
+            scIdx,
+            timeSec,
+            ampVal
+        };
+    }
+
+    updateHoverReadout(point) {
+        this.hoverState = {
+            x: point.mouseX,
+            y: point.mouseY,
+            frameIdx: point.frameIdx,
+            scIdx: point.scIdx,
+            timeSec: point.timeSec,
+            ampVal: point.ampVal
+        };
+
+        document.getElementById('hoverTime').textContent = `${point.timeSec.toFixed(3)} s`;
+        document.getElementById('hoverSubcarrier').textContent = `${point.scIdx}`;
+        document.getElementById('hoverAmplitude').textContent = `${point.ampVal.toFixed(2)}`;
+        document.getElementById('hoverFrame').textContent = `#${point.frameIdx}`;
+
         const tooltip = document.getElementById('heatmapTooltip');
+        if (tooltip) {
+            tooltip.style.display = 'block';
+            tooltip.style.left = `${point.clientX + 15}px`;
+            tooltip.style.top = `${point.clientY + 15}px`;
+            tooltip.innerHTML = `
+                <div><strong>Time:</strong> ${point.timeSec.toFixed(3)} s (#${point.frameIdx})</div>
+                <div><strong>Subcarrier:</strong> ${point.scIdx}</div>
+                <div><strong>Amplitude:</strong> ${point.ampVal.toFixed(3)} a.u.</div>
+            `;
+        }
+    }
 
+    initEvents() {
         this.canvas.addEventListener('mousemove', (e) => {
-            if (!this.data || !this.plotBounds) return;
-            const rect = this.canvas.getBoundingClientRect();
-            const mouseX = e.clientX - rect.left;
-            const mouseY = e.clientY - rect.top;
-
-            const { x: px, y: py, w: pw, h: ph } = this.plotBounds;
-
-            if (mouseX >= px && mouseX <= px + pw && mouseY >= py && mouseY <= py + ph) {
-                const numFrames = this.data.amplitudes.length;
-                const numSubcarriers = this.data.metadata.subcarriers || 64;
-
-                const fracX = (mouseX - px) / pw;
-                const fracY = (mouseY - py) / ph;
-
-                const frameIdx = Math.min(numFrames - 1, Math.max(0, Math.floor(fracX * numFrames)));
-                // Inverted Y: bottom is 0, top is numSubcarriers - 1
-                const scIdx = Math.min(numSubcarriers - 1, Math.max(0, Math.floor((1 - fracY) * numSubcarriers)));
-
-                const timeSec = this.data.timestamps && this.data.timestamps[frameIdx] !== undefined
-                    ? this.data.timestamps[frameIdx]
-                    : (frameIdx / numFrames) * this.data.metadata.duration_seconds;
-
-                const ampVal = this.data.amplitudes[frameIdx][scIdx];
-
-                this.hoverState = { x: mouseX, y: mouseY, frameIdx, scIdx, timeSec, ampVal };
-
-                // Update Readout Bar
-                document.getElementById('hoverTime').textContent = `${timeSec.toFixed(3)} s`;
-                document.getElementById('hoverSubcarrier').textContent = `${scIdx}`;
-                document.getElementById('hoverAmplitude').textContent = `${ampVal.toFixed(2)}`;
-                document.getElementById('hoverFrame').textContent = `#${frameIdx}`;
-
-                // Update Floating Tooltip
-                if (tooltip) {
-                    tooltip.style.display = 'block';
-                    tooltip.style.left = `${e.clientX + 15}px`;
-                    tooltip.style.top = `${e.clientY + 15}px`;
-                    tooltip.innerHTML = `
-                        <div><strong>Time:</strong> ${timeSec.toFixed(3)} s (#${frameIdx})</div>
-                        <div><strong>Subcarrier:</strong> ${scIdx}</div>
-                        <div><strong>Amplitude:</strong> ${ampVal.toFixed(3)} a.u.</div>
-                    `;
-                }
-
-                this.render();
-            } else {
+            const point = this.eventToPoint(e);
+            if (!point) {
                 this.clearHover();
+                return;
             }
+            this.updateHoverReadout(point);
+            this.render();
+        });
+
+        // Clicking a heatmap point computes occupancy for that point's second.
+        this.canvas.addEventListener('click', (e) => {
+            const point = this.eventToPoint(e);
+            if (!point) return;
+
+            this.updateHoverReadout(point);
+            this.occupancy = this.computeOccupancy(Math.floor(point.timeSec));
+            this.updateOccupancyUI();
+            this.render();
         });
 
         this.canvas.addEventListener('mouseleave', () => {
@@ -553,11 +682,57 @@ class CsiVisualizer {
 document.addEventListener('DOMContentLoaded', async () => {
     const visualizer = new CsiVisualizer('heatmapCanvas');
     const loadingOverlay = document.getElementById('loadingOverlay');
+    const loadingText = document.getElementById('loadingText');
+    let hideTimer = null;
 
     const hideLoading = () => {
-        if (loadingOverlay) {
-            loadingOverlay.style.opacity = '0';
-            setTimeout(() => loadingOverlay.style.display = 'none', 300);
+        if (!loadingOverlay || loadingOverlay.style.display === 'none') return;
+        clearTimeout(hideTimer);
+        loadingOverlay.style.opacity = '0';
+        hideTimer = setTimeout(() => {
+            loadingOverlay.style.display = 'none';
+        }, 300);
+    };
+
+    const showWaiting = (elapsedSeconds, warmupSeconds) => {
+        if (!loadingOverlay) return;
+        clearTimeout(hideTimer);
+        loadingOverlay.style.display = 'flex';
+        loadingOverlay.style.opacity = '1';
+        if (loadingText) {
+            const target = Number.isFinite(warmupSeconds) && warmupSeconds > 0 ? warmupSeconds : 3;
+            const elapsed = Number.isFinite(elapsedSeconds) ? elapsedSeconds : 0;
+            loadingText.textContent = `Waiting for CSI data… ${elapsed.toFixed(1)} s / ${target.toFixed(1)} s`;
+        }
+    };
+
+    let staticLoaded = false;
+
+    const applyPayload = (payload) => {
+        if (!payload) return;
+
+        if (payload.status === 'waiting') {
+            showWaiting(payload.elapsed_seconds, payload.warmup_seconds);
+            return;
+        }
+
+        if (payload.status === 'error') {
+            if (loadingText) loadingText.textContent = payload.message || 'Visualization error';
+            return;
+        }
+
+        // Live server: { status: "ready", data: {...} }
+        if (payload.status === 'ready' && payload.data && payload.data.amplitudes) {
+            visualizer.setData(payload.data);
+            hideLoading();
+            return;
+        }
+
+        // Static server: the payload itself is VisualizationData.
+        if (payload.amplitudes) {
+            visualizer.setData(payload);
+            hideLoading();
+            staticLoaded = true;
         }
     };
 
@@ -568,17 +743,25 @@ document.addEventListener('DOMContentLoaded', async () => {
         return;
     }
 
-    // 2. Fetch from web server endpoint
-    try {
-        const resp = await fetch('/api/data');
-        if (!resp.ok) throw new Error(`HTTP error ${resp.status}`);
-        const data = await resp.json();
-        visualizer.setData(data);
-    } catch (err) {
-        console.warn('Could not fetch /api/data, waiting for input:', err);
-        const loadingText = document.getElementById('loadingText');
-        if (loadingText) loadingText.textContent = 'No CSI data loaded. Use --serve or export standalone HTML.';
-    } finally {
-        hideLoading();
-    }
+    // 2. Poll the live/static server every 500 ms.
+    let polling = false;
+    const poll = async () => {
+        if (polling || staticLoaded) return;
+        polling = true;
+        try {
+            const resp = await fetch('/api/data', { cache: 'no-store' });
+            if (!resp.ok) throw new Error(`HTTP error ${resp.status}`);
+            applyPayload(await resp.json());
+        } catch (err) {
+            console.warn('Could not fetch /api/data, retrying:', err);
+            if (loadingText && loadingOverlay && loadingOverlay.style.display !== 'none') {
+                loadingText.textContent = 'Waiting for the visualization server…';
+            }
+        } finally {
+            polling = false;
+        }
+    };
+
+    await poll();
+    setInterval(poll, 500);
 });

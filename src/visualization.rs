@@ -21,6 +21,7 @@ use std::{
     fs::File,
     io::{self, Write},
     path::Path,
+    sync::{Arc, RwLock},
 };
 
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,11 @@ pub struct VisualizationMetadata {
     pub subcarriers: usize,
     /// Effective sample rate in packets per second.
     pub effective_pps: f64,
+    /// Nominal packet rate used to divide a one-second interval into occupancy
+    /// slots. For live streaming this is the configured `--pps`; for a decoded
+    /// file it defaults to [`VisualizationMetadata::effective_pps`].
+    #[serde(default)]
+    pub nominal_pps: f64,
     /// Wi-Fi channel if available.
     pub channel: Option<u8>,
     /// Hex-formatted device identifier if available.
@@ -88,6 +94,28 @@ pub struct VisualizationData {
     pub classification: Option<ClassificationResult>,
 }
 
+/// One state snapshot exposed by the live dashboard server.
+///
+/// The browser polls `/api/data` and receives either a waiting placeholder
+/// (during the warm-up period or before the first record arrives) or a ready
+/// [`VisualizationData`] payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum LiveDashboardSnapshot {
+    /// The dashboard is not ready to draw a heatmap yet.
+    Waiting {
+        /// Seconds elapsed since the streaming command started.
+        elapsed_seconds: f64,
+        /// Warm-up length requested by the streaming command.
+        warmup_seconds: f64,
+    },
+    /// The current sliding-window dataset is ready.
+    Ready {
+        /// Data to render in the heatmap.
+        data: Box<VisualizationData>,
+    },
+}
+
 /// Errors that can occur during data preparation or visualization export.
 #[derive(Debug)]
 pub enum VisualizationError {
@@ -114,6 +142,15 @@ pub enum VisualizationError {
         /// Previous ticks in microseconds.
         previous: u64,
         /// Current ticks in microseconds.
+        found: u64,
+    },
+    /// A record predates the requested visualization time origin.
+    TimestampBeforeOrigin {
+        /// Zero-based record index.
+        record: usize,
+        /// Origin ticks in microseconds.
+        origin: u64,
+        /// Record ticks in microseconds.
         found: u64,
     },
     /// The subcarrier count changed mid-capture.
@@ -150,6 +187,14 @@ impl fmt::Display for VisualizationError {
             } => write!(
                 f,
                 "record {record} ticks moved backwards: previous={previous} us, found={found} us"
+            ),
+            Self::TimestampBeforeOrigin {
+                record,
+                origin,
+                found,
+            } => write!(
+                f,
+                "record {record} ticks {found} us are before the visualization origin {origin} us"
             ),
             Self::SubcarrierCountChanged {
                 record,
@@ -208,9 +253,33 @@ pub fn decode_packets(bytes: &[u8]) -> Result<Vec<CsiPacket>, VisualizationError
 }
 
 /// Prepare [`VisualizationData`] from a slice of decoded [`CsiPacket`].
+///
+/// Timestamps start at `0.0` at the first packet's `device_ticks_us`.
 pub fn prepare_visualization_data(
     packets: &[CsiPacket],
     source_name: Option<&str>,
+) -> Result<VisualizationData, VisualizationError> {
+    let origin_ticks = packets
+        .first()
+        .map_or(0, |packet| packet.csi.device_ticks_us);
+    prepare_visualization_data_with_origin(packets, source_name, origin_ticks, None)
+}
+
+/// Prepare [`VisualizationData`] relative to an explicit time origin.
+///
+/// `origin_ticks` is the `device_ticks_us` value that maps to timestamp `0.0`.
+/// Passing the first packet of the whole capture while `packets` contains only
+/// a recent window keeps the window's timestamps at their absolute elapsed
+/// values (for example, a 30-second window at 32 seconds starts at `2.0`).
+///
+/// `nominal_pps` is stored in the metadata for the web occupancy calculation.
+/// When it is `None` or not positive, the effective PPS measured from the
+/// packets is used instead.
+pub fn prepare_visualization_data_with_origin(
+    packets: &[CsiPacket],
+    source_name: Option<&str>,
+    origin_ticks: u64,
+    nominal_pps: Option<f64>,
 ) -> Result<VisualizationData, VisualizationError> {
     let first = packets.first().ok_or(VisualizationError::NoRecords)?;
     let subcarriers = first.csi.num_sc as usize;
@@ -218,19 +287,25 @@ pub fn prepare_visualization_data(
         return Err(VisualizationError::NoSubcarriers { record: 0 });
     }
 
-    let first_ticks = first.csi.device_ticks_us;
-    if first_ticks == 0 {
+    if origin_ticks == 0 {
         return Err(VisualizationError::MissingDeviceTicks { record: 0 });
     }
 
     let mut timestamps = Vec::with_capacity(packets.len());
     let mut amplitudes = Vec::with_capacity(packets.len());
-    let mut previous_ticks = first_ticks;
+    let mut previous_ticks = origin_ticks;
 
     for (record, packet) in packets.iter().enumerate() {
         let ticks = packet.csi.device_ticks_us;
         if ticks == 0 {
             return Err(VisualizationError::MissingDeviceTicks { record });
+        }
+        if ticks < origin_ticks {
+            return Err(VisualizationError::TimestampBeforeOrigin {
+                record,
+                origin: origin_ticks,
+                found: ticks,
+            });
         }
         if ticks < previous_ticks {
             return Err(VisualizationError::NonMonotonicDeviceTicks {
@@ -248,8 +323,8 @@ pub fn prepare_visualization_data(
             });
         }
 
-        // Relative timestamp in seconds
-        let t_sec = (ticks - first_ticks) as f64 / 1_000_000.0;
+        // Relative timestamp in seconds from the requested origin.
+        let t_sec = (ticks - origin_ticks) as f64 / 1_000_000.0;
         timestamps.push(t_sec);
         amplitudes.push(packet.amplitudes());
         previous_ticks = ticks;
@@ -262,6 +337,9 @@ pub fn prepare_visualization_data(
     } else {
         0.0
     };
+    let nominal_pps = nominal_pps
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(effective_pps);
 
     let channel = Some(first.csi.channel);
     let device_id = Some(format!("0x{:08x}", first.csi.device_id));
@@ -269,12 +347,13 @@ pub fn prepare_visualization_data(
     let metadata = VisualizationMetadata {
         title: "CSI Amplitude Heatmap".to_string(),
         source: source_name.map(|s| s.to_string()),
-        start_time_us: first_ticks,
-        start_time_formatted: format!("0.000 s (Clock: {} µs)", first_ticks),
+        start_time_us: origin_ticks,
+        start_time_formatted: format!("0.000 s (Clock: {origin_ticks} µs)"),
         duration_seconds,
         total_frames,
         subcarriers,
         effective_pps,
+        nominal_pps,
         channel,
         device_id,
     };
@@ -339,20 +418,15 @@ impl VisualizationData {
 
         // Replace stylesheet link with inlined <style>
         let inlined_css = format!("<style>\n{}\n</style>", CSS_STYLES);
-        let html_with_css = HTML_TEMPLATE.replace(
-            r#"<link rel="stylesheet" href="style.css">"#,
-            &inlined_css,
-        );
+        let html_with_css =
+            HTML_TEMPLATE.replace(r#"<link rel="stylesheet" href="style.css">"#, &inlined_css);
 
         // Replace script tag with inlined data payload and script
         let inlined_js = format!(
             "<script>\nwindow.CSI_DATA = {};\n</script>\n<script>\n{}\n</script>",
             json_str, JS_VISUALIZER
         );
-        let bundle = html_with_css.replace(
-            r#"<script src="visualizer.js"></script>"#,
-            &inlined_js,
-        );
+        let bundle = html_with_css.replace(r#"<script src="visualizer.js"></script>"#, &inlined_js);
 
         Ok(bundle)
     }
@@ -384,9 +458,7 @@ pub async fn serve_dashboard(
         .await
         .map_err(|e| VisualizationError::Server(format!("Failed to bind to {bind_addr}: {e}")))?;
 
-    let json_bytes = data
-        .to_json()?
-        .into_bytes();
+    let json_bytes = data.to_json()?.into_bytes();
 
     println!("Visualization web server listening on http://{bind_addr}");
     println!("Press Ctrl+C to terminate the server.");
@@ -410,15 +482,27 @@ pub async fn serve_dashboard(
             let path = first_line.split_whitespace().nth(1).unwrap_or("/");
 
             let (status, content_type, body): (&str, &str, Vec<u8>) = match path {
-                "/" | "/index.html" => ("200 OK", "text/html; charset=utf-8", HTML_TEMPLATE.as_bytes().to_vec()),
-                "/style.css" => ("200 OK", "text/css; charset=utf-8", CSS_STYLES.as_bytes().to_vec()),
-                "/visualizer.js" => ("200 OK", "application/javascript; charset=utf-8", JS_VISUALIZER.as_bytes().to_vec()),
+                "/" | "/index.html" => (
+                    "200 OK",
+                    "text/html; charset=utf-8",
+                    HTML_TEMPLATE.as_bytes().to_vec(),
+                ),
+                "/style.css" => (
+                    "200 OK",
+                    "text/css; charset=utf-8",
+                    CSS_STYLES.as_bytes().to_vec(),
+                ),
+                "/visualizer.js" => (
+                    "200 OK",
+                    "application/javascript; charset=utf-8",
+                    JS_VISUALIZER.as_bytes().to_vec(),
+                ),
                 "/api/data" => ("200 OK", "application/json", json_data),
                 _ => ("404 Not Found", "text/plain", b"Not Found".to_vec()),
             };
 
             let header = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
                 body.len()
             );
 
@@ -426,5 +510,194 @@ pub async fn serve_dashboard(
             let _ = socket.write_all(&body).await;
             let _ = socket.flush().await;
         });
+    }
+}
+
+/// Start a live dashboard server that serves the current snapshot on every
+/// `/api/data` request.
+///
+/// Unlike [`serve_dashboard`], the payload is read from `state` for every
+/// request, so a producer can update it (for example, every 500 ms) while the
+/// browser polls. The page shell, CSS, and JavaScript are the same assets used
+/// by the static dashboard.
+///
+/// A snapshot is either [`LiveDashboardSnapshot::Waiting`] (draw a waiting
+/// message) or [`LiveDashboardSnapshot::Ready`] (draw the heatmap).
+pub async fn serve_dashboard_live(
+    state: Arc<RwLock<LiveDashboardSnapshot>>,
+    bind_addr: &str,
+) -> Result<(), VisualizationError> {
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind(bind_addr)
+        .await
+        .map_err(|e| VisualizationError::Server(format!("Failed to bind to {bind_addr}: {e}")))?;
+
+    serve_dashboard_live_on(listener, state).await
+}
+
+/// Serve a live dashboard on an already-bound listener.
+///
+/// Binding the listener before calling this function lets a caller fail fast
+/// and report the actual address (useful with port `0` in tests).
+pub async fn serve_dashboard_live_on(
+    listener: tokio::net::TcpListener,
+    state: Arc<RwLock<LiveDashboardSnapshot>>,
+) -> Result<(), VisualizationError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let addr = listener
+        .local_addr()
+        .map_err(|e| VisualizationError::Server(format!("Cannot read listener address: {e}")))?;
+
+    println!("Live visualization server listening on http://{addr}");
+    println!("Open the URL above. Press Ctrl+C to stop streaming.");
+
+    loop {
+        let (mut socket, _) = listener
+            .accept()
+            .await
+            .map_err(|e| VisualizationError::Server(format!("Accept error: {e}")))?;
+
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let n = match socket.read(&mut buf).await {
+                Ok(n) if n > 0 => n,
+                _ => return,
+            };
+
+            let req_str = String::from_utf8_lossy(&buf[..n]);
+            let first_line = req_str.lines().next().unwrap_or("");
+            let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+
+            let (status, content_type, body): (&str, &str, Vec<u8>) = match path {
+                "/" | "/index.html" => (
+                    "200 OK",
+                    "text/html; charset=utf-8",
+                    HTML_TEMPLATE.as_bytes().to_vec(),
+                ),
+                "/style.css" => (
+                    "200 OK",
+                    "text/css; charset=utf-8",
+                    CSS_STYLES.as_bytes().to_vec(),
+                ),
+                "/visualizer.js" => (
+                    "200 OK",
+                    "application/javascript; charset=utf-8",
+                    JS_VISUALIZER.as_bytes().to_vec(),
+                ),
+                "/api/data" => {
+                    let serialized = state
+                        .read()
+                        .ok()
+                        .and_then(|snapshot| serde_json::to_vec(&*snapshot).ok());
+
+                    match serialized {
+                        Some(body) => ("200 OK", "application/json; charset=utf-8", body),
+                        None => (
+                            "500 Internal Server Error",
+                            "application/json; charset=utf-8",
+                            br#"{"status":"error","message":"snapshot unavailable"}"#.to_vec(),
+                        ),
+                    }
+                }
+                _ => ("404 Not Found", "text/plain", b"Not Found".to_vec()),
+            };
+
+            let header = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+                body.len()
+            );
+
+            let _ = socket.write_all(header.as_bytes()).await;
+            let _ = socket.write_all(&body).await;
+            let _ = socket.flush().await;
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn capture_packets() -> Vec<CsiPacket> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("capture_v8.bin");
+        let bytes = std::fs::read(path).expect("capture_v8.bin should exist");
+        decode_packets(&bytes).expect("capture should decode")
+    }
+
+    #[test]
+    fn origin_keeps_absolute_window_timestamps() {
+        let packets = capture_packets();
+        let origin = packets[0].csi.device_ticks_us;
+        let window = &packets[100..];
+        let expected = (window[0].csi.device_ticks_us - origin) as f64 / 1_000_000.0;
+
+        let data =
+            prepare_visualization_data_with_origin(window, Some("window"), origin, Some(20.0))
+                .expect("window should prepare");
+
+        assert_eq!(data.metadata.start_time_us, origin);
+        assert_eq!(data.metadata.nominal_pps, 20.0);
+        assert_eq!(data.metadata.total_frames, window.len());
+        assert!((data.timestamps[0] - expected).abs() < 1e-12);
+        assert!(data.timestamps[0] > 4.0);
+    }
+
+    #[test]
+    fn nominal_pps_falls_back_to_the_effective_rate() {
+        let packets = capture_packets();
+        let data = prepare_visualization_data(&packets, None).expect("capture should prepare");
+
+        assert!((data.metadata.nominal_pps - data.metadata.effective_pps).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn live_server_reports_waiting_then_ready() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral listener");
+        let addr = listener.local_addr().expect("listener address");
+        let state = Arc::new(RwLock::new(LiveDashboardSnapshot::Waiting {
+            elapsed_seconds: 0.5,
+            warmup_seconds: 3.0,
+        }));
+        let server = tokio::spawn(serve_dashboard_live_on(listener, Arc::clone(&state)));
+
+        let url = format!("http://{addr}/api/data");
+        let client = reqwest::Client::new();
+
+        let waiting: serde_json::Value = client
+            .get(&url)
+            .send()
+            .await
+            .expect("waiting response")
+            .json()
+            .await
+            .expect("waiting json");
+        assert_eq!(waiting["status"], "waiting");
+        assert_eq!(waiting["warmup_seconds"].as_f64(), Some(3.0));
+
+        let packets = capture_packets();
+        let data = prepare_visualization_data(&packets[..10], Some("test")).expect("small window");
+        *state.write().expect("state lock") = LiveDashboardSnapshot::Ready {
+            data: Box::new(data),
+        };
+
+        let ready: serde_json::Value = client
+            .get(&url)
+            .send()
+            .await
+            .expect("ready response")
+            .json()
+            .await
+            .expect("ready json");
+        assert_eq!(ready["status"], "ready");
+        assert_eq!(ready["data"]["metadata"]["total_frames"].as_u64(), Some(10));
+
+        server.abort();
+        let _ = server.await;
     }
 }

@@ -249,12 +249,40 @@ impl Drop for AbortOnDrop {
 /// returned [`CollectionSummary`] contains the capabilities and sensing
 /// responses as well as byte and duration counters.
 ///
+/// This is the convenience form of [`collect_with_sink`] with a no-op chunk
+/// callback.
+///
 /// # Cancellation
 ///
 /// This future completes when the HTTP body ends (the device closes the
 /// stream) or an I/O/HTTP error occurs. Dropping the future aborts the HTTP
 /// request and the marker task.
 pub async fn collect(config: &CollectionConfig) -> Result<CollectionSummary, CollectionError> {
+    collect_with_sink(config, |_| {}).await
+}
+
+/// Collect the CSI stream and call `on_chunk` for every response chunk.
+///
+/// This behaves exactly like [`collect`], but each chunk is also passed to the
+/// callback after it has been written to [`CollectionConfig::output`]. The
+/// callback can feed an incremental [`crate::decoder::FrameStreamDecoder`] so a
+/// live consumer sees records while the raw `.bin` capture is still being
+/// written.
+///
+/// The callback is synchronous and runs on the collection task, so it should
+/// do only cheap work (for example, forward the chunk to a channel).
+///
+/// # Cancellation
+///
+/// Same as [`collect`]: dropping the future aborts the HTTP request, the
+/// marker task, and any remaining chunk delivery.
+pub async fn collect_with_sink<F>(
+    config: &CollectionConfig,
+    mut on_chunk: F,
+) -> Result<CollectionSummary, CollectionError>
+where
+    F: FnMut(&[u8]),
+{
     config.validate()?;
 
     let client = Client::new();
@@ -303,7 +331,7 @@ pub async fn collect(config: &CollectionConfig) -> Result<CollectionSummary, Col
     sleep(config.startup_delay).await;
 
     // 5. Stream the response body into the output file.
-    let streaming = stream_to_file(config, &client, &base).await;
+    let streaming = stream_to_file(config, &client, &base, &mut on_chunk).await;
 
     drop(marker_task);
     let (bytes_written, duration) = streaming?;
@@ -319,11 +347,17 @@ pub async fn collect(config: &CollectionConfig) -> Result<CollectionSummary, Col
 }
 
 /// Open `/csi` and copy the response body into the configured file.
-async fn stream_to_file(
+///
+/// After each chunk is written, `on_chunk` is called with the same bytes.
+async fn stream_to_file<F>(
     config: &CollectionConfig,
     client: &Client,
     base: &str,
-) -> Result<(u64, Duration), CollectionError> {
+    on_chunk: &mut F,
+) -> Result<(u64, Duration), CollectionError>
+where
+    F: FnMut(&[u8]),
+{
     let response = client
         .get(format!("{base}/csi"))
         .header("Origin", &config.origin)
@@ -340,6 +374,7 @@ async fn stream_to_file(
         let chunk = chunk?;
         file.write_all(&chunk).await?;
         total += chunk.len() as u64;
+        on_chunk(&chunk);
         if config.verbose {
             eprintln!("Received {total} bytes");
         }

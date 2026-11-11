@@ -2,7 +2,7 @@
 
 Living notes for the ESPectre V8 CSI decoder. Update this file as work progresses.
 
-Last updated: 2026-11-11 (data visualization module added; Canvas 2D heatmap implemented)
+Last updated: 2026-11-11 (streaming dashboard and click-to-compute occupancy added)
 
 > **2026-11-11 — visualization update.** The Data Visualization module is now implemented:
 > `src/visualization.rs` (data preparation, standalone bundle rendering, Tokio HTTP server),
@@ -10,6 +10,14 @@ Last updated: 2026-11-11 (data visualization module added; Canvas 2D heatmap imp
 > Canvas 2D renderer with Viridis/Plasma/Jet colormaps), `docs/visualization.md`, and
 > `tests/visualization.rs`. Initial experiment on `capture_v8.bin` successfully decodes
 > 691 frames across 64 subcarriers and generates `capture_v8_heatmap.html`.
+
+> **2026-11-11 — streaming update.** `src/streaming.rs` + `src/bin/streaming.rs` compose
+> collection, live decoding, and the visualization server: 3 s warm-up, 500 ms refresh,
+> 30 s sliding window with absolute time labels, and click-to-compute occupancy.
+> `docs/streaming.md` documents it. The visualization module now also exposes
+> `serve_dashboard_live`, `LiveDashboardSnapshot`, and
+> `prepare_visualization_data_with_origin`; `metadata.nominal_pps` drives the occupancy
+> slot count. `collection::collect_with_sink` provides the live chunk callback.
 
 > **2026-11-11 — modularization update.** The pipeline is now split into
 > `src/collection.rs` (live CSI streaming), `src/decoder.rs` (unchanged parser),

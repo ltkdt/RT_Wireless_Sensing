@@ -3,10 +3,7 @@
 //! Validates decoding and preparation of `capture_v8.bin` into the data structures
 //! required for HTML Canvas 2D heatmap rendering.
 
-use std::{
-    fs,
-    path::PathBuf,
-};
+use std::{fs, path::PathBuf};
 
 use rt_wireless_sensing::visualization::{VisualizationData, VisualizationError};
 
@@ -31,7 +28,10 @@ fn capture_decodes_into_visualization_matrix() {
 
     // Monotonicity check
     for window in data.timestamps.windows(2) {
-        assert!(window[1] > window[0], "timestamps must be strictly increasing");
+        assert!(
+            window[1] > window[0],
+            "timestamps must be strictly increasing"
+        );
     }
 
     // 3. Verify Amplitudes Matrix [N, 64]

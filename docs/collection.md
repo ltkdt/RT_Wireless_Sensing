@@ -39,6 +39,10 @@ usual way to change one value.
 | `startup_delay` | `Duration` | `200 ms` | Wait between sensing-enable and `/csi` |
 | `verbose` | `bool` | `true` | Print progress for every received chunk to stderr |
 
+Two recorded ip of ESP32:
+- 10.178.22.9
+- 10.178.22.62
+
 Helpers:
 
 - `CollectionConfig::default()` — the values above.
