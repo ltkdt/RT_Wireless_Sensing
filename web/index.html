@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CSI Amplitude Heatmap — RT-Wireless-Sensing</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="dashboard-container">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-title-group">
+                <h1>RT-Wireless-Sensing</h1>
+                <p>Wi-Fi Channel State Information (CSI) Real-Time Analytics & Visualization</p>
+            </div>
+            <div class="header-badge">
+                <span class="status-dot"></span>
+                <span>V8 CSI Stream</span>
+            </div>
+        </header>
+
+        <!-- Metrics & Classification Grid -->
+        <section class="metrics-grid">
+            <div class="metric-card">
+                <div class="metric-label">Start Time</div>
+                <div class="metric-value" id="metaStartTime">--</div>
+                <div class="metric-sub">Monotonic Sample Clock</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Duration</div>
+                <div class="metric-value" id="metaDuration">--</div>
+                <div class="metric-sub">Total elapsed time</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Decoded Frames</div>
+                <div class="metric-value" id="metaFrames">--</div>
+                <div class="metric-sub">64 subcarriers / frame</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-label">Effective Rate</div>
+                <div class="metric-value" id="metaRate">--</div>
+                <div class="metric-sub">Packets per second</div>
+            </div>
+            <div class="metric-card classification-card">
+                <div class="metric-label">Predicted Activity / Gesture</div>
+                <div class="classification-badge" id="classificationBadge">Standby / None</div>
+                <div class="metric-sub" id="classificationDetails">Awaiting inference model</div>
+            </div>
+        </section>
+
+        <!-- Main Heatmap Card -->
+        <main class="heatmap-card">
+            <!-- Toolbar -->
+            <div class="toolbar">
+                <div class="toolbar-controls">
+                    <div class="control-item">
+                        <label for="colormapSelect">Colormap:</label>
+                        <select id="colormapSelect">
+                            <option value="viridis" selected>Viridis (Standard)</option>
+                            <option value="plasma">Plasma</option>
+                            <option value="jet">Jet</option>
+                        </select>
+                    </div>
+                    <div class="control-item">
+                        <label>
+                            <input type="checkbox" id="smoothingToggle"> Bilinear Smoothing
+                        </label>
+                    </div>
+                    <button id="exportBtn" title="Save high-resolution PNG">Export PNG</button>
+                </div>
+
+                <!-- Hover Readout -->
+                <div class="hover-readout">
+                    <span><span class="hover-field">Time: </span><span class="hover-value" id="hoverTime">--</span></span>
+                    <span><span class="hover-field">SC: </span><span class="hover-value" id="hoverSubcarrier">--</span></span>
+                    <span><span class="hover-field">Amp: </span><span class="hover-value" id="hoverAmplitude">--</span></span>
+                    <span><span class="hover-field">Frame: </span><span class="hover-value" id="hoverFrame">--</span></span>
+                </div>
+            </div>
+
+            <!-- Heatmap Canvas Container -->
+            <div class="canvas-wrapper">
+                <div class="loading-overlay" id="loadingOverlay">
+                    <div class="spinner"></div>
+                    <span id="loadingText">Decoding CSI stream...</span>
+                </div>
+                <canvas id="heatmapCanvas" width="1200" height="520"></canvas>
+                <div class="heatmap-tooltip" id="heatmapTooltip"></div>
+            </div>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <span>RT-Wireless-Sensing Visualization Module &bull; Rust &amp; Canvas 2D</span>
+            <span>ESPectre V8 Protocol</span>
+        </footer>
+    </div>
+
+    <script src="visualizer.js"></script>
+</body>
+</html>

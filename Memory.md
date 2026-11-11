@@ -2,7 +2,21 @@
 
 Living notes for the ESPectre V8 CSI decoder. Update this file as work progresses.
 
-Last updated: 2026-11-08 (decoder, CLI and tests implemented; Python parity verified)
+Last updated: 2026-11-11 (data visualization module added; Canvas 2D heatmap implemented)
+
+> **2026-11-11 — visualization update.** The Data Visualization module is now implemented:
+> `src/visualization.rs` (data preparation, standalone bundle rendering, Tokio HTTP server),
+> `src/bin/visualize.rs` (standalone CLI), `web/` (`index.html`, `style.css`, `visualizer.js`
+> Canvas 2D renderer with Viridis/Plasma/Jet colormaps), `docs/visualization.md`, and
+> `tests/visualization.rs`. Initial experiment on `capture_v8.bin` successfully decodes
+> 691 frames across 64 subcarriers and generates `capture_v8_heatmap.html`.
+
+> **2026-11-11 — modularization update.** The pipeline is now split into
+> `src/collection.rs` (live CSI streaming), `src/decoder.rs` (unchanged parser),
+> and `src/saving.rs` (`.bin` → `.npz` with 129 arrays). `src/main.rs` is a thin
+> wrapper that calls the collector. Each module has a standalone binary
+> (`collect`, `decode`, `save`) and a document in `docs/`. Section 2 below
+> describes the repository as it was before this change and is kept as history.
 
 ---
 
