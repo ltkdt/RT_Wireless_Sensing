@@ -26,6 +26,7 @@ Currently this is used for Wi-Fi CSI sensing.
   interactive heatmap rendering.
 - **Python** (`scripts/`): creates plots and performs statistics to validate
   CSI data.
+- **Samples** (`/samples`): some recorded samples, from both the current project and Espectre collection command
 - **Documentation** (`docs/`): per-module API and standalone-command reference.
 
 ## Modules
