@@ -242,7 +242,10 @@ pub fn save_capture_to(bin_path: &Path, npz_path: &Path) -> Result<SaveSummary, 
 }
 
 /// Decode every complete frame in `bytes`.
-fn decode_capture(bytes: &[u8]) -> Result<Vec<CsiPacket>, SaveError> {
+///
+/// Shared with [`crate::dsp`], which builds a [`crate::dsp::CsiSignal`] from the
+/// same packets so there is exactly one decode path.
+pub(crate) fn decode_capture(bytes: &[u8]) -> Result<Vec<CsiPacket>, SaveError> {
     let mut decoder = FrameStreamDecoder::with_capacity(bytes.len().max(1_024));
     decoder.push(bytes);
 

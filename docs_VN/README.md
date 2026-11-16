@@ -9,6 +9,7 @@ sử dụng dòng lệnh.
 | Thu thập | `src/collection.rs` | Truyền dòng CSI thô từ ESPectre vào tệp `.bin` | `cargo run --bin collect -- --help` | [collection.md](collection.md) |
 | Giải mã | `src/decoder.rs` | Phân tích và xác thực khung CSI V8 | `cargo run --bin decode -- capture_v8.bin` | [decoder.md](decoder.md) |
 | Lưu trữ | `src/saving.rs` | Xuất timestamp/biên độ/pha ra `.npz` | `cargo run --bin save -- capture_v8.bin` | [saving.md](saving.md) |
+| DSP | `src/dsp/` | Xử lý tín hiệu đồng bộ trên CSI đã giải mã (`CsiSignal`): chuẩn hóa, resample, lọc Hampel/biquad, FFT/STFT | — (chỉ thư viện) | [dsp.md](dsp.md) |
 | Hiển thị | `src/visualization.rs` | Render bảng điều khiển heatmap biên độ CSI 2D | `cargo run --bin visualize -- capture_v8.bin` | [visualization.md](visualization.md) |
 | Phát trực tuyến | `src/streaming.rs` | Thu thập, giải mã trực tiếp và phục vụ heatmap trượt 30 giây | `cargo run --bin streaming -- --help` | [streaming.md](streaming.md) |
 | Schema | `src/csi_header.rs` | Các trường và hằng số header bản ghi V8 64-byte | — | [decoder.md](decoder.md) |

@@ -9,6 +9,7 @@ command-line use.
 | Collection | `src/collection.rs` | Stream raw CSI from ESPectre into a `.bin` | `cargo run --bin collect -- --help` | [collection.md](collection.md) |
 | Decoder | `src/decoder.rs` | Parse and validate V8 CSI frames | `cargo run --bin decode -- capture_v8.bin` | [decoder.md](decoder.md) |
 | Saving | `src/saving.rs` | Export timestamp/amplitude/phase to `.npz` | `cargo run --bin save -- capture_v8.bin` | [saving.md](saving.md) |
+| DSP | `src/dsp/` | Synchronous signal processing over decoded CSI (`CsiSignal`): normalize, resample, Hampel/biquad filters, FFT/STFT | — (library only) | [dsp.md](dsp.md) |
 | Visualization | `src/visualization.rs` | Render 2D CSI amplitude heatmap dashboard | `cargo run --bin visualize -- capture_v8.bin` | [visualization.md](visualization.md) |
 | Streaming | `src/streaming.rs` | Collect, decode live, and serve a 30 s sliding heatmap | `cargo run --bin streaming -- --help` | [streaming.md](streaming.md) |
 | Schema | `src/csi_header.rs` | 64-byte V8 record header fields and constants | — | [decoder.md](decoder.md) |

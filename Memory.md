@@ -19,6 +19,17 @@ Last updated: 2026-11-11 (streaming dashboard and click-to-compute occupancy add
 > `prepare_visualization_data_with_origin`; `metadata.nominal_pps` drives the occupancy
 > slot count. `collection::collect_with_sink` provides the live chunk callback.
 
+> **DSP rewrite update.** The deprecated `src/dsp.rs` (`load_csi`, `load_ticks`,
+> `mean_std`, `amplitude`, `fft_peaks`) is replaced by `src/dsp/` per `PLAN.md`:
+> `CsiSignal`/`DspError` in `mod.rs` (loaders `from_capture`/`from_npz`/
+> `from_packets`/`from_iq`), `preprocess.rs` (NormScheme + csi_ratio),
+> `resample.rs` (whole-record I/Q interpolation: Linear/Nearest/natural cubic
+> spline), `spectral.rs` (realfft FFT/STFT, windows, dominant_peaks),
+> `filter.rs` (moving/exp-moving/median/Hampel + biquad LPF/HPF/BPF via the
+> `biquad` crate). Deps added: `realfft`, `biquad`. All tests synthetic;
+> `cargo test --doc` covers the examples. Docs: `docs_EN/dsp.md`,
+> `docs_VN/dsp.md` (LaTeX math), README tables updated.
+
 > **2026-11-11 — modularization update.** The pipeline is now split into
 > `src/collection.rs` (live CSI streaming), `src/decoder.rs` (unchanged parser),
 > and `src/saving.rs` (`.bin` → `.npz` with 129 arrays). `src/main.rs` is a thin
@@ -55,7 +66,7 @@ Current task: decode `capture_v8.bin`. DSP/AI are explicitly out of scope
 | `src/bin/decode.rs` | **new** | CLI: text/JSON report, `--limit`, `--quiet` |
 | `tests/capture_v8.rs` | **new** | 6 end-to-end tests over the real 691-frame capture |
 | `scripts/verify_decoder.py` | **new** | Rust-vs-Python differential verifier (optional dev tool) |
-| `src/dsp.rs` | working helpers | loads `.npy`, amplitude, FFT; unused by `main` |
+| `src/dsp/` | **rewritten** (was `src/dsp.rs` helpers) | `CsiSignal` + normalize/resample/Hampel/biquad/FFT/STFT; synthetic tests + `tests/dsp.rs`; docs in `docs_EN/dsp.md`, `docs_VN/dsp.md` |
 | `Cargo.toml` | edition 2024 | unchanged; autodetects `lib.rs` and `src/bin/decode.rs` |
 
 Wiring:

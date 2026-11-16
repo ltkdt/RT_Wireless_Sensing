@@ -12,6 +12,8 @@ Currently this is used for Wi-Fi CSI sensing.
   - `decoder.rs` — parses and validates the V8 CSI records.
   - `saving.rs` — decodes a capture and exports timestamp, amplitude, and phase
     arrays to `.npz`.
+  - `dsp/` — offline signal processing over decoded CSI (`CsiSignal`): normalization,
+    whole-record resampling, Hampel/biquad filters, FFT/STFT. Library only.
   - `visualization.rs` — prepares decoded CSI data for 2D amplitude heatmap rendering.
   - `streaming.rs` — collects and decodes CSI while serving a live 30 s sliding
     heatmap dashboard.
@@ -33,6 +35,7 @@ Currently this is used for Wi-Fi CSI sensing.
 | **Collection** | `src/collection.rs` | Opens `/espectre/v1/csi`, sends UDP markers, and writes the raw byte stream to a `.bin` capture. | [docs_EN/collection.md](docs_EN/collection.md) | `cargo run --bin collect` |
 | **Decoder** | `src/decoder.rs` | Incrementally parses the 60-byte HTTP prefix and 64-byte V8 CSI header, validates counters, and exposes raw I/Q plus amplitude/phase. | [docs_EN/decoder.md](docs_EN/decoder.md) | `cargo run --bin decode -- capture_v8.bin` |
 | **Saving** | `src/saving.rs` | Decodes a collected `.bin` and writes a same-stem `.npz` with 1 timestamp + 64 amplitude + 64 phase arrays (129 total for 64 subcarriers). | [docs_EN/saving.md](docs_EN/saving.md) | `cargo run --bin save -- capture_v8.bin` |
+| **DSP** | `src/dsp/` | Synchronous signal processing over decoded CSI (`CsiSignal`): normalization, whole-record resampling, Hampel/median outlier removal, biquad LPF/HPF/BPF, FFT/STFT. Library only, no binary. | [docs_EN/dsp.md](docs_EN/dsp.md) | — |
 | **Visualization** | `src/visualization.rs` | Renders a 2D CSI amplitude heatmap dashboard via HTML Canvas 2D, exportable as standalone HTML or served over HTTP. | [docs_EN/visualization.md](docs_EN/visualization.md) | `cargo run --bin visualize -- capture_v8.bin` |
 | **Streaming** | `src/streaming.rs` | Collects and decodes CSI live, serving a 30 s sliding heatmap with a 3 s warm-up, 500 ms refresh, and click-to-compute occupancy. | [docs_EN/streaming.md](docs_EN/streaming.md) | `cargo run --bin streaming -- --help` |
 
@@ -58,7 +61,10 @@ decoder.
    immediately, waits 3 seconds, then refreshes a 30-second sliding heatmap
    every 500 ms. Clicking a point reports the occupancy of that second:
    `N_filled / N` slots, where `N` is the configured PPS.
-6. Downstream work (ONNX inference for localization) can consume the decoded
+6. The **dsp** module processes decoded CSI offline: `CsiSignal` loaders
+   (`.bin`/`.npz`), normalization, resampling onto a uniform grid, Hampel and
+   biquad filters, and FFT/STFT spectra.
+7. Downstream work (ONNX inference for localization) can consume the decoded
    packets or the `.npz` arrays. The AI pipeline is not implemented yet.
 
 ## Quick start
@@ -95,6 +101,7 @@ An example of the Web UI interface during streaming:
 - [Collection module](docs_EN/collection.md)
 - [Decoder module](docs_EN/decoder.md)
 - [Saving module](docs_EN/saving.md)
+- [DSP module](docs_EN/dsp.md)
 - [Visualization module](docs_EN/visualization.md)
 - [Streaming module](docs_EN/streaming.md)
 
@@ -130,6 +137,8 @@ nhận dạng hoạt động con người và định vị trong nhà. Hiện t�
   - `decoder.rs` — phân tích và xác thực các bản ghi CSI V8.
   - `saving.rs` — giải mã bản ghi và xuất mảng timestamp, biên độ, và pha
     sang `.npz`.
+  - `dsp/` — xử lý tín hiệu offline trên CSI đã giải mã (`CsiSignal`): chuẩn hóa,
+    resample, lọc Hampel/biquad, FFT/STFT. Chỉ thư viện.
   - `visualization.rs` — chuẩn bị dữ liệu CSI đã giải mã để render heatmap biên độ 2D.
   - `streaming.rs` — thu thập và giải mã CSI đồng thời phục vụ bảng điều khiển heatmap trượt 30 giây.
   - `csi_header.rs` — schema bản ghi V8 64-byte được sử dụng bởi bộ giải mã.
@@ -149,6 +158,7 @@ nhận dạng hoạt động con người và định vị trong nhà. Hiện t�
 | **Thu thập** | `src/collection.rs` | Mở `/espectre/v1/csi`, gửi marker UDP, và ghi dòng byte thô vào tệp `.bin`. | [docs_EN/collection.md](docs_EN/collection.md) | `cargo run --bin collect` |
 | **Giải mã** | `src/decoder.rs` | Phân tích từng phần prefix HTTP 60-byte và header CSI V8 64-byte, xác thực bộ đếm, và phơi bày I/Q thô cùng biên độ/pha. | [docs_EN/decoder.md](docs_EN/decoder.md) | `cargo run --bin decode -- capture_v8.bin` |
 | **Lưu trữ** | `src/saving.rs` | Giải mã tệp `.bin` đã thu thập và ghi tệp `.npz` cùng tên gốc với 1 timestamp + 64 biên độ + 64 pha (tổng 129 cho 64 subcarrier). | [docs_EN/saving.md](docs_EN/saving.md) | `cargo run --bin save -- capture_v8.bin` |
+| **DSP** | `src/dsp/` | Xử lý tín hiệu đồng bộ trên CSI đã giải mã (`CsiSignal`): chuẩn hóa, resample toàn bản ghi, lọc Hampel/biquad, FFT/STFT. Chỉ thư viện, không có nhị phân. | [docs_EN/dsp.md](docs_EN/dsp.md) | — |
 | **Hiển thị** | `src/visualization.rs` | Render bảng điều khiển heatmap biên độ CSI 2D thông qua HTML Canvas 2D, có thể xuất dưới dạng HTML độc lập hoặc phục vụ qua HTTP. | [docs_EN/visualization.md](docs_EN/visualization.md) | `cargo run --bin visualize -- capture_v8.bin` |
 | **Phát trực tuyến** | `src/streaming.rs` | Thu thập và giải mã CSI trực tiếp, phục vụ heatmap trượt 30 giây với 3 giây khởi động, làm mới 500 ms, và tính toán độ chiếm chỗ khi nhấp. | [docs_EN/streaming.md](docs_EN/streaming.md) | `cargo run --bin streaming -- --help` |
 
@@ -172,7 +182,10 @@ Schema bản ghi V8 chung ở `src/csi_header.rs` và được tài liệu hóa 
    ngay lập tức, chờ 3 giây, rồi làm mới heatmap trượt 30 giây
    mỗi 500 ms. Nhấp vào một điểm báo cáo độ chiếm chỗ của giây đó:
    `N_đã_điền / N` khe, trong đó `N` là PPS được cấu hình.
-6. Công việc hạ nguồn (suy luận ONNX cho định vị) có thể tiêu thụ các gói tin đã giải mã
+6. Mô-đun **dsp** xử lý CSI đã giải mã offline: các bộ nạp `CsiSignal`
+   (`.bin`/`.npz`), chuẩn hóa, resample lên lưới đều, bộ lọc Hampel và
+   biquad, và phổ FFT/STFT.
+7. Công việc hạ nguồn (suy luận ONNX cho định vị) có thể tiêu thụ các gói tin đã giải mã
    hoặc mảng `.npz`. Pipeline AI chưa được triển khai.
 
 ## Bắt đầu nhanh
@@ -209,6 +222,7 @@ Một ví dụ về giao diện UI Web trong quá trình phát trực tuyến:
 - [Mô-đun thu thập](docs_EN/collection.md)
 - [Mô-đun giải mã](docs_EN/decoder.md)
 - [Mô-đun lưu trữ](docs_EN/saving.md)
+- [Mô-đun DSP](docs_EN/dsp.md)
 - [Mô-đun hiển thị](docs_EN/visualization.md)
 - [Mô-đun phát trực tuyến](docs_EN/streaming.md)
 

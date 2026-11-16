@@ -9,6 +9,9 @@
 //!   without resynchronizing on corrupt input.
 //! * [`saving`] — decode a `.bin` capture and export timestamp, amplitude, and
 //!   phase arrays to a `.npz` archive.
+//! * [`dsp`] — synchronous signal processing over decoded CSI arrays
+//!   ([`dsp::CsiSignal`]): normalization, resampling, outlier removal,
+//!   biquad filters, FFT/STFT.
 //! * [`visualization`] — prepare decoded CSI records and render an interactive
 //!   2D amplitude heatmap web dashboard.
 //! * [`streaming`] — collect, decode live, and serve a sliding-window
@@ -22,6 +25,7 @@
 pub mod collection;
 pub mod csi_header;
 pub mod decoder;
+pub mod dsp;
 pub mod saving;
 pub mod streaming;
 pub mod visualization;
