@@ -91,6 +91,10 @@ pub struct CollectionConfig {
     ///
     /// The original streamer waited 200 ms so the ESP32 could start sampling.
     pub startup_delay: Duration,
+    /// Stop recording after this long.
+    ///
+    /// `None` (the default) records until the device closes the stream.
+    pub max_duration: Option<Duration>,
     /// Print a progress line to stderr for every received chunk.
     pub verbose: bool,
 }
@@ -105,6 +109,7 @@ impl Default for CollectionConfig {
             origin: DEFAULT_ORIGIN.to_string(),
             output: PathBuf::from(DEFAULT_OUTPUT),
             startup_delay: Duration::from_millis(200),
+            max_duration: None,
             verbose: true,
         }
     }
@@ -255,8 +260,9 @@ impl Drop for AbortOnDrop {
 /// # Cancellation
 ///
 /// This future completes when the HTTP body ends (the device closes the
-/// stream) or an I/O/HTTP error occurs. Dropping the future aborts the HTTP
-/// request and the marker task.
+/// stream), when [`CollectionConfig::max_duration`] elapses, or on an
+/// I/O/HTTP error. Dropping the future aborts the HTTP request and the
+/// marker task.
 pub async fn collect(config: &CollectionConfig) -> Result<CollectionSummary, CollectionError> {
     collect_with_sink(config, |_| {}).await
 }
@@ -369,8 +375,18 @@ where
     let mut stream = response.bytes_stream();
     let mut file = tokio::fs::File::create(&config.output).await?;
     let mut total = 0u64;
+    let mut deadline = config.max_duration.map(|max| Box::pin(sleep(max)));
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next = stream.next();
+        let chunk = match deadline.as_mut() {
+            Some(timer) => tokio::select! {
+                chunk = next => chunk,
+                _ = timer.as_mut() => break,
+            },
+            None => next.await,
+        };
+        let Some(chunk) = chunk else { break };
         let chunk = chunk?;
         file.write_all(&chunk).await?;
         total += chunk.len() as u64;
@@ -444,5 +460,17 @@ mod tests {
             config.validate(),
             Err(CollectionError::InvalidPps)
         ));
+    }
+
+    #[test]
+    fn max_duration_defaults_to_unlimited() {
+        assert_eq!(CollectionConfig::default().max_duration, None);
+
+        let config = CollectionConfig {
+            max_duration: Some(Duration::from_secs(20)),
+            ..CollectionConfig::default()
+        };
+        assert_eq!(config.max_duration, Some(Duration::from_secs(20)));
+        assert!(config.validate().is_ok());
     }
 }

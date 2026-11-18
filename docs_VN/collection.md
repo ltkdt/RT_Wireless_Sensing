@@ -18,8 +18,8 @@ Nó không phân tích các byte; đó là công việc của
    tệp đầu ra, ghi đè nếu tệp đã tồn tại.
 
 Tác vụ marker bị hủy khi phát trực tuyến kết thúc hoặc xảy ra lỗi. Cuộc gọi
-trả về khi thiết bị đóng dòng (hoặc yêu cầu thất bại); nó không
-dừng sau một khoảng thời gian cố định.
+trả về khi thiết bị đóng dòng (hoặc yêu cầu thất bại), hoặc sớm hơn
+khi `max_duration` hết hạn.
 
 ## API quan trọng
 
@@ -37,6 +37,7 @@ cách thông thường để thay đổi một giá trị.
 | `origin` | `String` | `"https://test.espectre.dev"` | Tiêu đề HTTP `Origin` |
 | `output` | `PathBuf` | `"capture_v8.bin"` | Đích ghi thô |
 | `startup_delay` | `Duration` | `200 ms` | Chờ giữa bật cảm biến và `/csi` |
+| `max_duration` | `Option<Duration>` | `None` | Dừng ghi sau khoảng thời gian này; `None` ghi cho đến khi luồng kết thúc |
 | `verbose` | `bool` | `true` | In tiến độ cho mọi chunk nhận được lên stderr |
 
 Hai địa chỉ IP đã ghi của ESP32:
@@ -121,10 +122,13 @@ cargo run --bin collect -- --ip 10.178.22.9 --output capture_v8.bin
 
 # Marker nhanh hơn, không tiến độ theo chunk
 cargo run --bin collect -- --pps 50 --quiet
+
+# Ghi trong 20 giây (đơn vị mặc định là giây; myös ms/s/m/h hoạt động)
+cargo run --bin collect -- --duration 20
 ```
 
 Tùy chọn: `--ip`, `--api-port`, `--marker-port`, `--pps`, `--origin`,
-`--output`, `--quiet`, `-h/--help`.
+`--output`, `--duration`, `--quiet`, `-h/--help`.
 
 Nhị phân mặc định (`cargo run` hoặc
 `cargo run --bin rt-wireless-sensing`) gọi `collect` với

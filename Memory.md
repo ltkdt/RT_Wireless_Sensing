@@ -1,86 +1,161 @@
 # Memory — RT-Wireless-Sensing
 
-Living notes for the ESPectre V8 CSI decoder. Update this file as work progresses.
+Living notes for the project: **design decisions and verified facts** that are not
+obvious from any single source file. Per-module usage and API reference live in
+`docs_EN/` (English) and `docs_VN/` (Vietnamese) and in rustdoc — do not duplicate
+them here. This file is not a changelog.
 
-Last updated: 2026-11-11 (streaming dashboard and click-to-compute occupancy added)
+> `PLAN.md` is **deprecated**. It planned the DSP rewrite, which is implemented in
+> `src/dsp/` and documented in `docs_EN/dsp.md` / `docs_VN/dsp.md`. Do not follow it.
 
-> **2026-11-11 — visualization update.** The Data Visualization module is now implemented:
-> `src/visualization.rs` (data preparation, standalone bundle rendering, Tokio HTTP server),
-> `src/bin/visualize.rs` (standalone CLI), `web/` (`index.html`, `style.css`, `visualizer.js`
-> Canvas 2D renderer with Viridis/Plasma/Jet colormaps), `docs/visualization.md`, and
-> `tests/visualization.rs`. Initial experiment on `capture_v8.bin` successfully decodes
-> 691 frames across 64 subcarriers and generates `capture_v8_heatmap.html`.
-
-> **2026-11-11 — streaming update.** `src/streaming.rs` + `src/bin/streaming.rs` compose
-> collection, live decoding, and the visualization server: 3 s warm-up, 500 ms refresh,
-> 30 s sliding window with absolute time labels, and click-to-compute occupancy.
-> `docs/streaming.md` documents it. The visualization module now also exposes
-> `serve_dashboard_live`, `LiveDashboardSnapshot`, and
-> `prepare_visualization_data_with_origin`; `metadata.nominal_pps` drives the occupancy
-> slot count. `collection::collect_with_sink` provides the live chunk callback.
-
-> **DSP rewrite update.** The deprecated `src/dsp.rs` (`load_csi`, `load_ticks`,
-> `mean_std`, `amplitude`, `fft_peaks`) is replaced by `src/dsp/` per `PLAN.md`:
-> `CsiSignal`/`DspError` in `mod.rs` (loaders `from_capture`/`from_npz`/
-> `from_packets`/`from_iq`), `preprocess.rs` (NormScheme + csi_ratio),
-> `resample.rs` (whole-record I/Q interpolation: Linear/Nearest/natural cubic
-> spline), `spectral.rs` (realfft FFT/STFT, windows, dominant_peaks),
-> `filter.rs` (moving/exp-moving/median/Hampel + biquad LPF/HPF/BPF via the
-> `biquad` crate). Deps added: `realfft`, `biquad`. All tests synthetic;
-> `cargo test --doc` covers the examples. Docs: `docs_EN/dsp.md`,
-> `docs_VN/dsp.md` (LaTeX math), README tables updated.
-
-> **2026-11-11 — modularization update.** The pipeline is now split into
-> `src/collection.rs` (live CSI streaming), `src/decoder.rs` (unchanged parser),
-> and `src/saving.rs` (`.bin` → `.npz` with 129 arrays). `src/main.rs` is a thin
-> wrapper that calls the collector. Each module has a standalone binary
-> (`collect`, `decode`, `save`) and a document in `docs/`. Section 2 below
-> describes the repository as it was before this change and is kept as history.
+Last updated: 2026-11-18 (rewritten: implemented features removed since they are in
+the docs; kept design decisions + verified facts; added collection `max_duration`)
 
 ---
 
-## 1. Project scope (from `README.md`)
+## 1. Current project state
 
-Rust framework for real-time Wi-Fi CSI sensing:
+Rust crate (edition 2024) for real-time Wi-Fi CSI sensing with an ESPectre ESP32.
+The firmware is external ([francescopace/espectre](https://github.com/francescopace/espectre))
+and is not modified here.
 
-1. ESPectre firmware on an ESP32 captures CSI; this repo does not modify it.
-2. This repo opens `/espectre/v1/csi` and writes the raw byte stream to
-   `capture_v8.bin` (`src/main.rs`).
-3. The captured bytes must be **decoded** into CSI records (the current task).
-4. Decoded CSI feeds a web amplitude heatmap, `.npz` storage, and later ONNX
-   inference for localization.
+```
+src/
+  lib.rs            pub mod collection, csi_header, decoder, saving, dsp, visualization, streaming
+  collection.rs     ESPectre HTTP API + UDP markers + raw .bin capture   (bin: collect, default main)
+  csi_header.rs     64-byte V8 record schema (shared with decoder)
+  decoder.rs        incremental V8 frame parser/validator               (bin: decode)
+  saving.rs         .bin -> .npz export                                 (bin: save)
+  dsp/              offline signal processing, library only             (mod, preprocess, resample, spectral, filter)
+  visualization.rs  heatmap data prep + standalone HTML / HTTP server   (bin: visualize)
+  streaming.rs      collect + live decode + dashboard in one process    (bin: streaming)
+web/                static frontend: index.html, style.css, visualizer.js (Canvas 2D, Viridis/Plasma/Jet)
+scripts/            verify_decoder.py (Rust-vs-Python differential check), inspect_espectre_data.py
+tests/              capture_v8.rs, dsp.rs, saving.rs, visualization.rs (integration)
+samples/            espectre_data/*.npz (labeled: free_space, standstill, wavehand_vert), raw_record/*.bin
+docs_EN/, docs_VN/  per-module docs in two languages
+artifacts/          git-ignored: capture_v8.bin, 50pps_test.bin, heatmap HTML, decoder output
+```
 
-Current task: decode `capture_v8.bin`. DSP/AI are explicitly out of scope
-(`plan.md` §6).
+Pipeline: ESP32 → `collection` writes raw bytes → `decoder` parses frames →
+`saving` exports `.npz` → `dsp` processes offline; `visualization`/`streaming`
+render heatmaps (offline file or live).
 
----
-
-## 2. Current repository state
-
-| File | State | Notes |
-|---|---|---|
-| `src/main.rs` | working streamer | GETs `/espectre/v1/csi`, writes chunks verbatim; **not yet wired to the decoder** |
-| `src/lib.rs` | **new** | exposes `csi_header` and `decoder` as a library |
-| `src/csi_header.rs` | **complete schema** | 21 fields, flag/enum constants, name helpers |
-| `src/decoder.rs` | **implemented** | LE parser, validation, `FrameStreamDecoder`, 31 unit tests |
-| `src/bin/decode.rs` | **new** | CLI: text/JSON report, `--limit`, `--quiet` |
-| `tests/capture_v8.rs` | **new** | 6 end-to-end tests over the real 691-frame capture |
-| `scripts/verify_decoder.py` | **new** | Rust-vs-Python differential verifier (optional dev tool) |
-| `src/dsp/` | **rewritten** (was `src/dsp.rs` helpers) | `CsiSignal` + normalize/resample/Hampel/biquad/FFT/STFT; synthetic tests + `tests/dsp.rs`; docs in `docs_EN/dsp.md`, `docs_VN/dsp.md` |
-| `Cargo.toml` | edition 2024 | unchanged; autodetects `lib.rs` and `src/bin/decode.rs` |
-
-Wiring:
-
-- `cargo test` builds the library, the streamer, the decoder binary and the
-  integration tests. `decoder.rs` is now compiled and tested.
-- The live streamer still only records bytes. Feeding `FrameStreamDecoder` from
-  `bytes_stream()` is the next integration step (§9).
-- `git status`: `README.md` modified; new `Memory.md`, `src/lib.rs`,
-  `src/decoder.rs`, `src/bin/decode.rs`, `tests/capture_v8.rs`.
+**Test data caveat (verified):** integration tests and the visualization unit tests
+read `capture_v8.bin` from the repo root (`CARGO_MANIFEST_DIR`), but the file is not
+tracked — a copy lives in the git-ignored `artifacts/`. Run
+`cp artifacts/capture_v8.bin .` before `cargo test --all-targets`, or those tests
+fail with "capture_v8.bin should exist".
 
 ---
 
-## 3. Sources of truth
+## 2. Design decisions (keep these invariants)
+
+### 2.1 Module ownership / layering
+
+- **Collection never parses bytes.** It writes exactly the `GET /csi` response body
+  to the `.bin`; `decoder` is the only parser ("one decoder, many consumers").
+- **DSP never re-parses `.bin`.** It consumes arrays from `saving` (`.npz`) or a
+  thin `CsiSignal` loader over the decoder. No second decode path.
+- The **60-byte HTTP frame prefix** and the **64-byte CSI record header** are
+  different structures and must not be confused (offsets, magics, counters differ).
+- `streaming` composes the modules instead of duplicating them: it uses
+  `collection::collect_with_sink`, whose per-chunk callback feeds a live
+  `FrameStreamDecoder` while the raw `.bin` is still written.
+
+### 2.2 Collection behavior
+
+Sequence per run: `GET /capabilities` → `PATCH /sensing` with
+`{"traffic_generator_mode": "external"}` → spawn UDP marker sender (4-byte marker
+`F0 9F 91 BB`, the "👻" emoji, at `pps`) → wait `startup_delay` → `GET /csi` and
+copy chunks verbatim to `output`.
+
+- Cancellation: the marker task is held in an `AbortOnDrop` guard, so dropping the
+  `collect` future aborts both the HTTP request and the marker task.
+- `max_duration: Option<Duration>` (default `None` = until the device closes the
+  stream). When set, the streaming loop races each chunk against a deadline and
+  returns normally with the `CollectionSummary` (`duration` ≈ the limit). CLI:
+  `collect --duration 20` (bare number = seconds; `ms`/`s`/`m`/`h` suffixes work).
+- `validate()`: `pps > 0` and the marker endpoint must parse.
+
+### 2.3 Decoder rules
+
+- Fail-fast, two-layer validation (envelope, then record) plus envelope↔record
+  counter cross-checks. **No magic-scan / silent resynchronization**: on error the
+  bytes stay buffered and parsing stops.
+- `FrameStreamDecoder` is streaming-safe (`push` / `next_frame` / `finish`); frames
+  may be split across reads or several per read. `finish()` distinguishes a
+  truncated final frame (`Truncated`) from stray bytes (`TrailingBytes`).
+- Seed "previous" counters from the **first** frame (a capture may begin
+  mid-session); enforce strictly increasing `stream_sequence`,
+  `fresh_record_total == prev + 1`, monotone drop/backpressure counters, and the
+  saturated `min(u32::MAX)` cross-checks.
+- Semantics after parsing: `wifi_rx_ts_us` / `wifi_rx_start_ts_ns` are `None` unless
+  their flag bits are set; `noise_floor_dbm == -128` → `None`; `device_id == 0` and
+  `device_ticks_us == 0` → `None`.
+
+### 2.4 Saving
+
+`.bin` → same-stem `.npz`: `timestamp_ms` (milliseconds relative to the first
+record, from `device_ticks_us`) plus `amplitude_00..63` and `phase_00..63` —
+**129 arrays for 64 subcarriers**, each of length N frames.
+
+### 2.5 DSP principles
+
+- Synchronous and pure: no tokio, no network, no file I/O inside DSP functions;
+  deterministic transforms over `ndarray`.
+- `CsiSignal { amplitude, phase, ticks_us, fs }` is the composable core type;
+  `fs` comes from the median tick interval. Errors are a `DspError` enum — no
+  `Box<dyn Error>` in public signatures.
+- Dependency policy: prefer a maintained crate that adds the function without
+  async/network baggage; otherwise hand-roll and unit-test. Chosen: `realfft`
+  (one-sided real FFT), `biquad` (RBJ LPF/HPF/BPF), `ndarray`/`ndarray-npy`.
+- Resample the **whole record at once** on a uniform grid derived from cumulative
+  ticks — never per-second chunks (boundary kinks). Interpolate **I/Q**, then
+  recompute amplitude/phase; never interpolate amplitude or raw phase. Methods:
+  Linear / Nearest / natural cubic spline (spline recommended for spectral work).
+- FFT is one-sided with `2 / window_sum` amplitude scaling; windows
+  None/Hann/Hamming/Blackman; STFT default Hann with 50% overlap. Window guidance:
+  ~10–20 s for breathing (0.1–0.5 Hz), ~0.5–1 s for motion/gestures (0.2–10 Hz).
+- Outlier removal per subcarrier: moving / exponential-moving / median / Hampel;
+  typical chains: BPF 0.1–0.5 Hz for breathing, HPF to strip static reflections
+  before gesture analysis.
+- DWT (wavelets) and PCA/compression are explicitly out of scope for `dsp`.
+
+### 2.6 Visualization / streaming
+
+- `web/` is a self-contained static frontend; `visualization.rs` either embeds it
+  into one standalone `.html` output or serves it over a Tokio HTTP server.
+- `streaming` defaults: port **8080**, warm-up **3 s**, refresh **500 ms**, sliding
+  window **30 s** with absolute time labels. Clicking the heatmap reports occupancy
+  of that second as `N_filled / N` slots, where `N` = configured PPS
+  (`metadata.nominal_pps` drives the slot count).
+
+---
+
+## 3. Defaults and constants (verified in source)
+
+Collection (`src/collection.rs`):
+
+| Constant | Value |
+|---|---|
+| `DEFAULT_ESP32_IP` | `10.178.22.9` (second recorded device: `10.178.22.62`) |
+| `DEFAULT_API_PORT` | `62587` |
+| `DEFAULT_MARKER_PORT` | `5555` |
+| `DEFAULT_PPS` | `20` |
+| `DEFAULT_ORIGIN` | `https://test.espectre.dev` |
+| `DEFAULT_OUTPUT` | `capture_v8.bin` |
+| `startup_delay` | `200 ms` |
+| `max_duration` | `None` (unlimited) |
+| `verbose` | `true` |
+
+Streaming (`src/streaming.rs`): `DEFAULT_PORT = 8080`,
+`DEFAULT_WARMUP = 3 s`, `DEFAULT_UPDATE_INTERVAL = 500 ms`,
+`DEFAULT_WINDOW = 30 s`.
+
+---
+
+## 4. Sources of truth
 
 Read (not guessed) from the local ESPectre checkout at
 `/home/ltkdt/Development/espectre/`:
@@ -104,7 +179,7 @@ side (60 and 64 bytes).
 
 ---
 
-## 4. Wire format
+## 5. Wire format (verified)
 
 The capture is **not** a bare sequence of CSI headers. Each frame is:
 
@@ -120,9 +195,9 @@ The capture is **not** a bare sequence of CSI headers. Each frame is:
 - `prefix.record_len` = size of **record header + payload** (not the prefix).
 - Therefore `frame_len = prefix.header_len + prefix.record_len`
   (`csi_io.py` L947).
-- In this capture `record_len = 64 + 128 = 192`, so `frame_len = 252`.
+- In the reference capture `record_len = 64 + 128 = 192`, so `frame_len = 252`.
 
-### 4.1 HTTP frame prefix — 60 bytes (`<IBBH16sQHHQQQ`)
+### 5.1 HTTP frame prefix — 60 bytes (`<IBBH16sQHHQQQ`)
 
 Offsets are relative to the start of the frame.
 
@@ -140,7 +215,7 @@ Offsets are relative to the start of the frame.
 | 44 | 8 | u64 | `Q` | `raw_drop_total` | records not sent (queue full / invalid / batch failure) |
 | 52 | 8 | u64 | `Q` | `raw_send_backpressure_total` | batch sends the client did not accept |
 
-### 4.2 CSI record header — 64 bytes (`<HBBBBIHHQQIQBbbQIIBBB`)
+### 5.2 CSI record header — 64 bytes (`<HBBBBIHHQQIQBbbQIIBBB`)
 
 Offsets are relative to the record start (frame offset 60). The payload starts
 at `record_start + header_len` (normally +64).
@@ -169,7 +244,7 @@ at `record_start + header_len` (normally +64).
 | 62 | 1 | u8 | `B` | `ltf_type_code` | `RawCsiLtfType` |
 | 63 | 1 | u8 | `B` | `channel_width_code` | `RawCsiChannelWidth` |
 
-### 4.3 Enumerations and flags
+### 5.3 Enumerations and flags
 
 | Enum | Values |
 |---|---|
@@ -185,7 +260,7 @@ at `record_start + header_len` (normally +64).
 | 2 (0x04) | `RAW_CSI_FLAG_WIFI_RX_START_TS_NS_VALID` | `wifi_rx_start_ts_ns` is usable |
 | 3 (0x08) | `RAW_CSI_FLAG_FRESH` | always set on emitted records |
 
-### 4.4 Payload
+### 5.4 Payload
 
 `csi_len_bytes` bytes of interleaved **signed 8-bit** samples. Reference
 convention (`csi_io.py` L346–349, proven by the test at L180–206):
@@ -208,12 +283,12 @@ firmware does not emit it here. Do **not** reorder payload bytes at decode time.
 
 ---
 
-## 5. Validation contract (mirror `_consume_raw_frames`)
+## 6. Validation contract (mirrors `_consume_raw_frames`)
 
-Validation happens in two layers. The Rust decoder must reproduce both, but
-report errors instead of raising on the first anomaly.
+Validation happens in two layers; the decoder reproduces both and reports errors
+instead of raising on the first anomaly.
 
-### 5.1 Envelope checks (per frame, `csi_io.py` L950–964)
+### 6.1 Envelope checks (per frame, `csi_io.py` L950–964)
 
 1. `magic == 0x52505345`
 2. `version == 1`
@@ -229,7 +304,7 @@ report errors instead of raising on the first anomaly.
 12. `raw_send_backpressure_total >= previous value`
 13. `len(buffer) >= frame_len` else wait for more bytes (streaming)
 
-### 5.2 Record checks (`csi_io.py` L404–412)
+### 6.2 Record checks (`csi_io.py` L404–412)
 
 1. `magic == 0x4353`
 2. `version == 8`
@@ -239,36 +314,33 @@ report errors instead of raising on the first anomaly.
 6. `record_start + header_len + csi_len_bytes` fits in the frame
 7. `next_offset == frame_len`, i.e. `prefix.record_len == csi_header_len + csi_len_bytes`
 
-### 5.3 Cross-checks between layers (`csi_io.py` L980–989)
+### 6.3 Cross-checks between layers (`csi_io.py` L980–989)
 
 1. `csi.seq_num == min(stream_sequence, 0xFFFFFFFF)`
 2. `csi.request_counter == min(stream_sequence, 0xFFFFFFFF)`
 3. `csi.fresh_counter == min(fresh_record_total, 0xFFFFFFFF)`
 4. `csi.transport_counter == raw_send_backpressure_total`
 
-### 5.4 Semantics applied after parsing
+### 6.4 Semantics applied after parsing
 
 - `wifi_rx_ts_us` → `None` unless flag bit 1 is set.
 - `wifi_rx_start_ts_ns` → `None` unless flag bit 2 is set.
 - `noise_floor_dbm == -128` → `None`.
-- `device_id == 0` → `None`; `device_ticks_us == 0` → `None` (`or None` in Python).
+- `device_id == 0` → `None`; `device_ticks_us == 0` → `None`.
 - `flags & 0x08` → `csi_fresh`.
 - `CSIPacket.timestamp` is **not** a wire field: the reference fills it with
   `time.time()` at parse time. Do not mistake it for a device timestamp.
 - `seq_num` repeats when the device saturates at `u32::MAX`; a gap in
   `stream_sequence` means packets were dropped before send (also visible in
-  `raw_drop_total` deltas), not necessarily parse failure.
-
-For file decoding, seed "previous" values from the **first** frame rather than
-assuming 1/0, because a capture may begin mid-session. Report the seed values.
+  `raw_drop_total` deltas), not necessarily a parse failure.
 
 ---
 
-## 6. Verified facts about `capture_v8.bin`
+## 7. Verified facts about the reference capture
 
-Measured with a throwaway script that mirrors the reference structs, and
-cross-checked by importing the real `tools.lib.csi_io` parser (first record
-decodes identically).
+`capture_v8.bin` (copy in `artifacts/`, recorded from an ESP32-C5 at 20 PPS),
+measured with a script mirroring the reference structs and cross-checked against
+ESPectre's real `tools.lib.csi_io` parser:
 
 | Property | Value |
 |---|---|
@@ -298,156 +370,38 @@ decodes identically).
 | Payload SHA-256 | `840ba4c87683f055cb4e28537b84c4124f1968ccb7a3556c113405070e3b9b11` |
 | File SHA-256 | `dd98ef43d7dbe9f9fd899398f91aa2bf36e85682e5bd79fc1c9e88c91b2ae938` |
 | Sum of all raw I/Q bytes | -42,069 |
+| Payload FNV-1a 64 (locked by `tests/capture_v8.rs`) | `0x6446fc78e2c7f3e6` |
 | Global amplitude mean / std | 24.768 / 10.369 |
 | First record, bin 4 | raw `[Q=5, I=-20]`, amp 20.615528, phase 2.896614 |
 
-### 6.1 Corrections to `plan.md`
-
-- `plan.md` §3 claims the payload starts at `0x7C` with
-  `05 ec 06 eb 06 eb 06 ea`. It **does** start at 0x7C (124), but the first
-  four *complex* bins (8 bytes) are zeros: `0x7C..0x83`, and `05 ec …` begins
-  at **0x84**. This is the centered guard-null pattern, not a header offset
-  error. Layout is otherwise confirmed.
-- `plan.md` §2.2 says "21 fields"; correct. But note the field named
-  `channel` sits at offset 42 **after** the two 8-byte timestamps — easy to
-  mis-order if copying from the C++ struct visually.
+**Cross-validation results:** Rust decoder vs ESPectre Python
+(`tools.lib.csi_io.parse_csi_record`): **691/691 records, 0 metadata mismatches**;
+`scripts/verify_decoder.py` made 15,899 field comparisons with 0 mismatches.
+Demo decode run: 34.499 s, 20.00 records/s, 0 gaps, 0 drops, 0 backpressure.
 
 ---
 
-## 7. Implemented Rust design
-
-### 7.1 Files
-
-```
-src/lib.rs          pub mod csi_header; pub mod decoder;
-src/csi_header.rs   21-field CsiHeader + flag/enum constants + name helpers
-src/decoder.rs      LeReader, HttpFrameHeader, CsiPacket, DecodeError,
-                    FrameStreamDecoder, parse_record, 31 unit tests
-src/bin/decode.rs   CLI: text/JSON report, --limit, --quiet
-tests/capture_v8.rs 6 end-to-end tests over the real capture
-```
-
-`main.rs` (the live streamer) was left untouched.
-
-### 7.2 Types and API
-
-- `HttpFrameHeader` — 11 fields of §4.1, plus `parse(bytes, base)` and
-  `frame_len()`. `WIRE_LEN = 60`.
-- `CsiHeader` — 21 fields of §4.2. Methods: `first_word_invalid()`,
-  `wifi_rx_ts_valid()`, `wifi_rx_start_ts_ns_valid()`, `is_fresh()`,
-  `valid_wifi_rx_ts_us()`, `valid_wifi_rx_start_ts_ns()`,
-  `valid_noise_floor_dbm()`, plus `chip_name()` / `phy_mode_name()` /
-  `ltf_type_name()` / `channel_width_name()`.
-- `CsiPacket { frame, csi, iq_raw: Vec<i8> }` with `iq()`, `iq_pairs()`
-  (yields `(I, Q)` from the wire order `[Q, I]`), `amplitudes()`, `phases()`,
-  `subcarriers()`.
-- `DecodeError` — 20 variants, each with an absolute byte `offset`:
-  `Truncated`, `BadFrameMagic`, `UnsupportedProtocolVersion`,
-  `UnsupportedRecordVersion`, `BadFrameHeaderLength`, `SessionChanged`,
-  `StreamSequenceNotIncreasing`, `NonZeroFrameFlags`,
-  `RecordLengthOutOfRange`, `FreshTotalNotSequential`,
-  `DropCounterWentBackwards`, `BackpressureCounterWentBackwards`,
-  `BadRecordMagic`, `RecordHeaderTooShort`, `ZeroPayloadLength`,
-  `PayloadLengthMismatch`, `PayloadTooLarge`, `RecordLengthMismatch`,
-  `CounterMismatch`, `TrailingBytes`. Implements `Display` and
-  `std::error::Error`.
-- `FrameStreamDecoder` — `push(&[u8])`,
-  `next_frame() -> Result<Option<CsiPacket>, DecodeError>`, `finish()`,
-  `session_id()`, `frames_decoded()`, `bytes_consumed()`, `buffered_len()`.
-  Handles frames split across reads and several frames per read; suitable for
-  both files and the future live socket path.
-
-### 7.3 Parsing rules as implemented
-
-- `LeReader` performs explicit little-endian reads
-  (`u16::from_le_bytes`, …) with bounds checks. The buffer is never cast into
-  a Rust struct.
-- The envelope is validated before waiting for the complete frame (fail fast),
-  exactly like `_consume_raw_frames()`.
-- `stream_sequence` and `fresh_record_total` state is seeded from the first
-  frame's requirements (1 and 1 respectively; a capture starts at session
-  start). Drop/backpressure counters start at 0.
-- The record is parsed only from one complete frame; its declared size must
-  equal `prefix.record_len`.
-- All four envelope↔record counter cross-checks are enforced, including
-  `min(u32::MAX)` saturation.
-- On error, bytes are left in the buffer and parsing stops. There is no magic
-  scan / silent resynchronization. `finish()` distinguishes a truncated final
-  frame (`Truncated`) from stray bytes (`TrailingBytes`).
-
-### 7.4 CLI
+## 8. Testing
 
 ```bash
-cargo run --bin decode -- capture_v8.bin              # per-record table + summary
-cargo run --bin decode -- capture_v8.bin --limit 10   # cap printed rows
-cargo run --bin decode -- capture_v8.bin --json       # JSON Lines
-cargo run --bin decode -- capture_v8.bin --quiet      # summary only
+cp artifacts/capture_v8.bin .   # tests expect it at the repo root
+cargo test --all-targets
+cargo clippy --all-targets
 ```
 
-Text summary includes frame count, bytes, a whole-payload FNV-1a 64 checksum,
-session id, device id, sequence range, gaps/missing, drop and backpressure
-deltas, duration from device ticks, and records/s. JSON mode emits
-`{"type":"record",…}` lines and a final `{"type":"summary",…}` object (with
-`payload_fnv1a64` as a hex string); payload arrays are intentionally not
-dumped.
-
-Example failure output:
-
-```
-error: input ended with undecoded data: truncated HTTP frame body at offset 99792: need 252 bytes, have 208
-error: decode failed after 1 frame(s), at byte 252: bad HTTP frame magic at offset 252: 0x52505300
-```
-
-### 7.5 Test coverage
-
-- 31 unit tests: one valid frame; I/Q order (`[10,20,-30,40] → [20+10j,40-30j]`);
-  split frame; two frames per push; every error variant; noise-floor sentinel.
-- 6 integration tests: 691 records; first-record byte-level fields; payload sum
-  `-42_069`; FNV-1a 64 `0x6446_fc78_e2c7_f3e6`; bin 4 amplitude/phase; null
-  bins; dense sequence; 37-byte chunked input.
-- `scripts/verify_decoder.py` compares the CLI's JSON with ESPectre's Python
-  parser: 15,899 field comparisons, 0 mismatches.
-- `cargo clippy --lib --bins --tests` is clean.
-
-### 7.6 Verification results
-
-- Rust vs ESPectre Python (`tools.lib.csi_io.parse_csi_record`): **691/691
-  records, 0 metadata mismatches**, 88,448 payload bytes compared by hash/sum.
-- File: 691 frames, 174,132 bytes, zero trailing data.
-- Demo run: 34.499 s, 20.00 records/s, 0 gaps, 0 drops, 0 backpressure.
-
-### 7.7 Still open
-
-- Wiring `FrameStreamDecoder` into the live `main.rs` stream.
-- Classic-vs-centered layout auto-detection (not needed for this capture).
-- A binary/`.npz` export of the I/Q arrays for the DSP stage.
+- `tests/capture_v8.rs` locks the whole-file decode of the real capture (691
+  records, payload FNV `0x6446fc78e2c7f3e6`, byte-level first-record fields).
+- `tests/saving.rs` verifies the `.npz` layout and golden values;
+  `tests/dsp.rs` and `tests/visualization.rs` cover the other modules.
+- `scripts/verify_decoder.py` re-runs the Rust-vs-Python differential check.
 
 ---
 
-## 8. Progress log
+## 9. Open / future work
 
-- [x] Read `README.md`, `plan.md`, all `src/*.rs`, `Cargo.toml`.
-- [x] Read ESPectre C++ framing headers, Python reference parser, docs, tests.
-- [x] Reverse-verify every byte of `capture_v8.bin` (691/691 frames valid).
-- [x] Document field map, offsets, enums, flags, validation order.
-- [x] Cross-check with the real Python parser (first record identical).
-- [x] Implement `src/decoder.rs` (types, LE helpers, envelope + record parse).
-- [x] Wire module into build (`src/lib.rs`) and add CLI (`src/bin/decode.rs`).
-- [x] Add 31 unit + 6 integration tests, including a Python-parity check.
-- [x] Produce the metadata report (`cargo run --bin decode -- capture_v8.bin`).
-- [x] Verify all 691 records against Python (15,899 comparisons, 0 mismatches).
-- [x] Add `scripts/verify_decoder.py` to make that check repeatable.
-- [x] `cargo test` (37 passing) and `cargo clippy` (clean).
-
-## 9. Next step
-
-The V8 decoder is done and validated. Remaining work, in order:
-
-1. Wire `FrameStreamDecoder` into `src/main.rs`: push each network chunk, then
-   drain `next_frame()`. Keep writing the raw `capture_v8.bin` for reference.
-2. Convert decoded packets into the numeric arrays the DSP stage expects
-   (`csi_data` as `N × 128` `i8`, `device_ticks_us`, metadata) and write `.npz`.
-3. Feed amplitudes to the web heatmap described in `README.md`.
-4. Optional: use the ESPectre Python parser as a fuzz oracle for more captures.
-
-Do not start DSP/AI work until the live path uses this decoder.
+- ONNX inference for localization is **not implemented**; it should consume
+  decoded packets or the `.npz` arrays (README pipeline step 7).
+- Rendering DSP output (e.g. `Spectrogram` as a heatmap) inside the visualization
+  dashboard is a possible follow-up; `Spectrogram`/`Spectrum` are plain-data structs
+  so the visualization layer does not depend on dsp internals.
+- More captures can be validated with the ESPectre Python parser as a fuzz oracle.

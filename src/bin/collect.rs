@@ -7,7 +7,7 @@
 //! cargo run --bin collect -- --ip 10.178.22.9 --output capture_v8.bin
 //! ```
 
-use std::{env, process::ExitCode};
+use std::{env, process::ExitCode, time::Duration};
 
 use rt_wireless_sensing::collection::{CollectionConfig, collect};
 
@@ -24,6 +24,8 @@ options:
   --pps N             marker packets per second (default: 20)
   --origin URL        HTTP Origin header (default: https://test.espectre.dev)
   --output FILE       capture file to overwrite (default: capture_v8.bin)
+  --duration DURATION stop recording after DURATION, e.g. 20, 20s, 500ms, 2m
+                      (default unit: seconds; omit for no limit)
   --quiet             do not print per-chunk progress
   -h, --help          show this help
 ";
@@ -87,6 +89,9 @@ where
             "--ip" => config.esp32_ip = value(&mut args, "--ip")?,
             "--origin" => config.origin = value(&mut args, "--origin")?,
             "--output" => config.output = value(&mut args, "--output")?.into(),
+            "--duration" => {
+                config.max_duration = Some(parse_duration(&value(&mut args, "--duration")?)?);
+            }
             "--api-port" => {
                 config.api_port = value(&mut args, "--api-port")?
                     .parse()
@@ -119,6 +124,32 @@ where
 {
     args.next()
         .ok_or_else(|| format!("{option} requires a value"))
+}
+
+/// Parse a duration such as `20`, `20s`, `500ms`, `2m`, or `1h`.
+///
+/// A bare number is interpreted in seconds.
+fn parse_duration(text: &str) -> Result<Duration, String> {
+    let text = text.trim();
+    let (number, multiplier) = if let Some(n) = text.strip_suffix("ms") {
+        (n, 0.001)
+    } else if let Some(n) = text.strip_suffix('s') {
+        (n, 1.0)
+    } else if let Some(n) = text.strip_suffix('m') {
+        (n, 60.0)
+    } else if let Some(n) = text.strip_suffix('h') {
+        (n, 3600.0)
+    } else {
+        (text, 1.0)
+    };
+    let seconds = number
+        .parse::<f64>()
+        .map_err(|_| format!("--duration requires a number, got {text:?}"))?
+        * multiplier;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(format!("--duration must be positive, got {text:?}"));
+    }
+    Ok(Duration::from_secs_f64(seconds))
 }
 
 #[cfg(test)]
@@ -166,5 +197,45 @@ mod tests {
         assert!(parse(&["--nope"]).is_err());
         assert!(parse(&["--pps"]).is_err());
         assert!(parse(&["--pps", "many"]).is_err());
+    }
+
+    #[test]
+    fn duration_is_unlimited_by_default() {
+        let ParsedArgs::Run(config) = parse(&[]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(config.max_duration, None);
+    }
+
+    #[test]
+    fn duration_flag_uses_seconds_by_default() {
+        let ParsedArgs::Run(config) = parse(&["--duration", "20"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(config.max_duration, Some(Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn duration_flag_accepts_unit_suffixes() {
+        let cases = [
+            ("500ms", Duration::from_millis(500)),
+            ("1.5s", Duration::from_millis(1500)),
+            ("2m", Duration::from_secs(120)),
+            ("1h", Duration::from_secs(3600)),
+        ];
+        for (input, expected) in cases {
+            let ParsedArgs::Run(config) = parse(&["--duration", input]).unwrap() else {
+                panic!("expected a run for {input}");
+            };
+            assert_eq!(config.max_duration, Some(expected), "input: {input}");
+        }
+    }
+
+    #[test]
+    fn duration_flag_rejects_bad_values() {
+        assert!(parse(&["--duration"]).is_err());
+        assert!(parse(&["--duration", "abc"]).is_err());
+        assert!(parse(&["--duration", "0"]).is_err());
+        assert!(parse(&["--duration", "-5"]).is_err());
     }
 }

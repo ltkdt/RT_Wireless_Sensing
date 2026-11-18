@@ -18,8 +18,8 @@ raw CSI byte stream. It does not parse the bytes; that is the
    output file, overwriting it if it already exists.
 
 The marker task is aborted when streaming ends or an error occurs. The call
-returns when the device closes the stream (or the request fails); it does not
-stop after a fixed duration.
+returns when the device closes the stream (or the request fails), or earlier
+when `max_duration` elapses.
 
 ## Important API
 
@@ -37,6 +37,7 @@ usual way to change one value.
 | `origin` | `String` | `"https://test.espectre.dev"` | HTTP `Origin` header |
 | `output` | `PathBuf` | `"capture_v8.bin"` | Raw capture destination |
 | `startup_delay` | `Duration` | `200 ms` | Wait between sensing-enable and `/csi` |
+| `max_duration` | `Option<Duration>` | `None` | Stop recording after this long; `None` records until the stream ends |
 | `verbose` | `bool` | `true` | Print progress for every received chunk to stderr |
 
 Two recorded ip of ESP32:
@@ -122,10 +123,13 @@ cargo run --bin collect -- --ip 10.178.22.9 --output capture_v8.bin
 
 # Faster markers, no per-chunk progress
 cargo run --bin collect -- --pps 50 --quiet
+
+# Record for 20 seconds (unit defaults to seconds; ms/s/m/h also work)
+cargo run --bin collect -- --duration 20
 ```
 
 Options: `--ip`, `--api-port`, `--marker-port`, `--pps`, `--origin`,
-`--output`, `--quiet`, `-h/--help`.
+`--output`, `--duration`, `--quiet`, `-h/--help`.
 
 The default binary (`cargo run` or
 `cargo run --bin rt-wireless-sensing`) calls `collect` with
