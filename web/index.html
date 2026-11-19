@@ -99,12 +99,27 @@
             </label>
         </div>
 
-        <!-- Diagnostic View (Phase 1: placeholder values; separate canvas, heatmap untouched when off) -->
+        <!-- Diagnostic View (separate canvas, heatmap untouched when off) -->
         <section class="diagnostic-card" id="diagnosticSection" hidden>
             <div class="diagnostic-header">
-                <h2>Diagnostic slot grid</h2>
+                <h2>Diagnostic view</h2>
                 <span class="diagnostic-hint" id="diagnosticHint">Click the heatmap above to select a second.</span>
             </div>
+            <div class="diag-overview" id="diagOverviewBox">
+                <div class="diag-overview-head">
+                    <h3>Capture overview</h3>
+                    <span class="diag-info" id="overviewInfo" data-tip="summary">&#9432;</span>
+                </div>
+                <div class="diag-overview-body">
+                    <canvas id="overviewCanvas" width="200" height="200"></canvas>
+                    <div class="diag-overview-side">
+                        <div class="diag-kpis" id="overviewKpis"></div>
+                        <div class="diag-overview-legend" id="overviewLegend"></div>
+                    </div>
+                </div>
+                <div class="diag-tooltip" id="overviewTooltip"></div>
+            </div>
+            <h3 class="diag-subheading">Slot grid — selected second</h3>
             <div class="slot-legend" id="slotLegend" hidden>
                 <span class="legend-item"><span class="legend-swatch legend-filled" id="legendFilledSwatch"></span>filled (amplitude)</span>
                 <span class="legend-item"><span class="legend-swatch legend-empty"></span>empty slot</span>

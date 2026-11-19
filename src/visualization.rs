@@ -308,6 +308,57 @@ pub struct DiagnosticSecondStats {
     pub partial: bool,
 }
 
+/// Number of empty slots per [`DiagnosticCause`] over the whole capture.
+///
+/// Every empty slot between the first and the last received record is counted
+/// exactly once, so the five fields sum to [`DiagnosticSummary::empty_slots`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DiagnosticCauseCounts {
+    /// Empty slots attributed to the RX device (record never sent).
+    pub device_drop: u64,
+    /// Empty slots attributed to the desktop client (batch not accepted).
+    pub desktop_backpressure: u64,
+    /// Empty slots attributed to over-air loss (TX/airtime).
+    pub air_loss: u64,
+    /// Empty slots with no record generated (generator or firmware).
+    pub generator_missed: u64,
+    /// Empty slots no boundary record closes (capture or window edge).
+    pub ambiguous: u64,
+}
+
+/// Capture-level aggregation of the diagnostic trace.
+///
+/// Covers the span from the first to the last received record only: slots
+/// before the first record and after the last one are not part of the capture,
+/// so they are neither filled nor empty. `ambiguous` therefore absorbs the
+/// capture edge and the live-window edge instead of distorting the attribution
+/// of the other causes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DiagnosticSummary {
+    /// Covered span in slots: `filled_records + empty_slots`.
+    pub total_slots: u64,
+    /// Records received inside the covered span.
+    pub filled_records: u64,
+    /// Slots inside the covered span without a record.
+    pub empty_slots: u64,
+    /// `empty_slots / total_slots`; `0.0` for an empty trace.
+    pub loss_ratio: f64,
+    /// Empty slots grouped by cause.
+    pub cause_counts: DiagnosticCauseCounts,
+    /// Σ(`Δstream − 1`) over the empty slots: packets offered to the stream but
+    /// never received.
+    pub dropped_frames_total: u64,
+    /// Σ`Δraw_drop_total` over the empty slots — RX-side drops.
+    pub delta_drop_total: u64,
+    /// Σ`Δraw_send_backpressure_total` over the empty slots — batches the
+    /// desktop did not accept.
+    pub delta_backpressure_total: u64,
+    /// Empty slots classified as over-air loss (low neighbouring RSSI).
+    pub empty_slots_low_rssi: u64,
+}
+
 /// Diagnostic trace for the dashboard's diagnostic view (PPS-deficit analysis).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiagnosticTrace {
@@ -330,6 +381,12 @@ pub struct DiagnosticTrace {
     pub empty_slots: Vec<DiagnosticEmptySlot>,
     /// Per-second statistics, one row per second covered by the trace.
     pub seconds: Vec<DiagnosticSecondStats>,
+    /// Capture-level aggregation of the empty slots, for the overview panel.
+    ///
+    /// `#[serde(default)]` keeps payloads written before this field existed
+    /// parseable; the web layer falls back to aggregating `empty_slots` itself.
+    #[serde(default)]
+    pub summary: DiagnosticSummary,
 }
 
 /// Complete dataset prepared for the web visualization layer.
@@ -587,6 +644,7 @@ fn build_diagnostic_trace(
 
     let empty_slots = collect_empty_slots(&records, slots);
     let seconds = collect_second_stats(&records, &empty_slots, slots);
+    let summary = collect_summary(&records, &empty_slots);
 
     DiagnosticTrace {
         slots_per_second: slots,
@@ -595,6 +653,63 @@ fn build_diagnostic_trace(
         records,
         empty_slots,
         seconds,
+        summary,
+    }
+}
+
+/// Aggregate every empty slot of the trace into one [`DiagnosticSummary`].
+///
+/// The covered span is `filled_records + empty_slots`: [`collect_empty_slots`]
+/// enumerates exactly the slots between the first and the last record, so the
+/// two counts partition it and `loss_ratio` describes the capture, not the
+/// wall-clock duration.
+fn collect_summary(
+    records: &[DiagnosticRecord],
+    empty_slots: &[DiagnosticEmptySlot],
+) -> DiagnosticSummary {
+    let mut cause_counts = DiagnosticCauseCounts::default();
+    let mut dropped_frames_total = 0u64;
+    let mut delta_drop_total = 0u64;
+    let mut delta_backpressure_total = 0u64;
+    let mut empty_slots_low_rssi = 0u64;
+
+    for empty in empty_slots {
+        let counter = match empty.cause {
+            DiagnosticCause::DeviceDrop => &mut cause_counts.device_drop,
+            DiagnosticCause::DesktopBackpressure => &mut cause_counts.desktop_backpressure,
+            DiagnosticCause::AirLoss => &mut cause_counts.air_loss,
+            DiagnosticCause::GeneratorMissed => &mut cause_counts.generator_missed,
+            DiagnosticCause::Ambiguous => &mut cause_counts.ambiguous,
+        };
+        *counter += 1;
+
+        dropped_frames_total += empty.dropped_frames;
+        delta_drop_total += empty.delta_drop;
+        delta_backpressure_total += empty.delta_backpressure;
+        if empty.cause == DiagnosticCause::AirLoss {
+            empty_slots_low_rssi += 1;
+        }
+    }
+
+    let filled_records = records.len() as u64;
+    let empty_count = empty_slots.len() as u64;
+    let total_slots = filled_records + empty_count;
+    let loss_ratio = if total_slots == 0 {
+        0.0
+    } else {
+        empty_count as f64 / total_slots as f64
+    };
+
+    DiagnosticSummary {
+        total_slots,
+        filled_records,
+        empty_slots: empty_count,
+        loss_ratio,
+        cause_counts,
+        dropped_frames_total,
+        delta_drop_total,
+        delta_backpressure_total,
+        empty_slots_low_rssi,
     }
 }
 

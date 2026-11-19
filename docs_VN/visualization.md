@@ -60,15 +60,37 @@ Một canvas riêng nằm sau công tắc ở cuối trang, độc lập với h
 mỗi giây chỉ thu được ít mẫu CSI hơn PPS đã cấu hình?*
 
 Nhấp vào một điểm trên heatmap để chọn giây của điểm đó, rồi bật **Chế độ chẩn
-đoán**. Canvas vẽ ma trận `subcarrier × khe` của giây đó (`khe` = PPS danh định
-được làm tròn một lần trong Rust); các cột trống được gạch chéo. Di chuột lên một
-ô chỉ hiện một dòng định danh (`Slot 12/99 · SC 31 — filled (frame #431)`); nhấp
-vào ô sẽ đổ dữ liệu vào hộp **Chi tiết khe thời gian** bên dưới canvas, còn hộp
-**Thống kê** hiển thị các con số của giây đó.
+đoán**. Bảng điều khiển mở đầu bằng **Tổng quan capture** phủ toàn bộ trace, tiếp
+theo là **Lưới khe — giây đã chọn**. Lưới vẽ ma trận `subcarrier × khe` của giây
+đó (`khe` = PPS danh định được làm tròn một lần trong Rust); các cột trống được
+gạch chéo. Di chuột lên một ô chỉ hiện một dòng định danh
+(`Slot 12/99 · SC 31 — filled (frame #431)`); nhấp vào ô sẽ đổ dữ liệu vào hộp
+**Chi tiết khe thời gian** bên dưới canvas, còn hộp **Thống kê** hiển thị các con
+số của giây đó.
 
 Mọi giá trị đều được tính trong Rust từ chính tệp `.bin` — tiền tố HTTP 60 byte
 và header bản ghi CSI 64 byte — rồi gửi trong trường `diagnostics` của payload,
 nên có thể xuất cùng các con số đó bằng `--json` để phân tích ngoại tuyến.
+
+#### Tổng quan capture
+
+Phần tổng quan gộp toàn bộ khe trống của trace, nên nó trả lời câu hỏi *PPS đã đi
+đâu* cho cả capture thay vì từng giây một. Nó hiển thị ngay khi bật công tắc,
+không cần chọn giây, và làm mới theo mỗi lần poll.
+
+- **Hàng KPI:** số bản ghi / tổng số khe, tỉ lệ mất %, số khe trống, số khung bị
+  mất, Δ`raw_drop_total`, Δ`raw_send_backpressure_total`.
+- **Biểu đồ vành khuyên:** các khe trống chia theo nguyên nhân, mỗi nguyên nhân
+  một màu cố định, kèm một dòng chú giải cho mỗi nguyên nhân với số lượng và
+  phần trăm trên tổng số khe trống. `ambiguous` là một lát riêng, nên biên cửa sổ
+  trực tiếp không bao giờ làm sai lệch việc quy gán các nguyên nhân khác.
+- **Tooltip:** di chuột lên một KPI, một dòng chú giải hoặc ký hiệu ⓘ sẽ giải
+  thích trường payload tương ứng.
+
+Phần trăm được tính trên các khe trống nằm trong **khoảng phủ** — từ bản ghi đầu
+tiên đến bản ghi cuối cùng. Các khe trước bản ghi đầu và sau bản ghi cuối không
+thuộc capture, nên không được tính là đầy hay trống; `capture_end` và
+`seconds[].partial` đánh dấu các biên đó.
 
 #### Payload
 
@@ -80,6 +102,10 @@ nên có thể xuất cùng các con số đó bằng `--json` để phân tích
 | `records[]` | Một dòng cho mỗi bản ghi nhận được: khe, độ lệch khe, Δstream, Δdrop, Δbackpressure, Δticks, Δwifi_rx, RSSI/noise/SNR, flags, kênh/PHY/độ rộng |
 | `empty_slots[]` | Một dòng cho mỗi khe không có bản ghi: nguyên nhân, số khung bị mất, bản ghi biên |
 | `seconds[]` | Thống kê từng giây: số lượng, khoảng Δtick, cụm trống, độ lệch khe, bộ đếm theo tầng, chất lượng vô tuyến, bất thường |
+| `summary` | Tổng hợp cấp capture cho bảng tổng quan: `total_slots`, `filled_records`, `empty_slots`, `loss_ratio`, `cause_counts`, `dropped_frames_total`, `delta_drop_total`, `delta_backpressure_total`, `empty_slots_low_rssi` |
+
+`summary` mang `#[serde(default)]`: payload được ghi trước khi trường này tồn tại
+vẫn parse được, và khi đó lớp web tự gộp `empty_slots`.
 
 #### Ngữ nghĩa khe
 

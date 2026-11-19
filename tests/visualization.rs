@@ -503,3 +503,77 @@ fn explicit_pps_keeps_the_slot_grid_at_the_configured_rate() {
     let measured_trace = measured.diagnostics.as_ref().expect("trace");
     assert!(measured_trace.slots_per_second < 100);
 }
+
+#[test]
+fn capture_summary_aggregates_empty_slot_causes() {
+    // 10 slots per second: slot i starts at i * 100 ms. One gap of each
+    // attributable kind, plus a trailing slot with no closing record:
+    //
+    //   slot 0 filled | 1 device_drop | 2 filled | 3 desktop_backpressure
+    //   slot 4 filled (weak) | 5 air_loss | 6 filled | 7 generator_missed
+    //   slot 8 filled | 9 ambiguous (no closing record)
+    let origin = 1_000_000;
+    let samples = [
+        Sample::new(1, origin),
+        // Slot 1: the stream skipped two frames and the device counted both as
+        // raw drops -> device_drop, 2 dropped frames.
+        Sample::new(4, origin + 200_000).drop(2),
+        // Slot 3: the stream skipped one frame and the desktop reported
+        // backpressure -> desktop_backpressure, 1 dropped frame.
+        Sample::new(6, origin + 400_000).backpressure(1),
+        // Slot 4 is weak and slot 6 is normal, so slot 5 is the only gap
+        // bordered by a weak record -> air_loss.
+        Sample::new(7, origin + 450_000).rssi(-80),
+        Sample::new(8, origin + 600_000),
+        // Slot 7: contiguous counters and normal RSSI on both sides ->
+        // generator_missed.
+        Sample::new(9, origin + 800_000),
+        // Slot 8 is filled by the last record; slot 9 has no closing record
+        // after it -> ambiguous.
+        Sample::new(10, origin + 850_000),
+    ];    let data = prepare(&samples, origin, 10.0);
+    let trace = data.diagnostics.as_ref().expect("trace");
+    let summary = &trace.summary;
+
+    // Covered span: slots 0..=9 of second 0, i.e. 7 filled + 5 empty.
+    assert_eq!(summary.filled_records, 7);
+    assert_eq!(summary.empty_slots, 5);
+    assert_eq!(summary.total_slots, 12);
+    assert!((summary.loss_ratio - 5.0 / 12.0).abs() < 1e-12);
+
+    assert_eq!(summary.cause_counts.device_drop, 1);
+    assert_eq!(summary.cause_counts.desktop_backpressure, 1);
+    assert_eq!(summary.cause_counts.air_loss, 1);
+    assert_eq!(summary.cause_counts.generator_missed, 1);
+    assert_eq!(summary.cause_counts.ambiguous, 1);
+
+    // The five cause buckets partition the empty slots.
+    let counted = summary.cause_counts.device_drop
+        + summary.cause_counts.desktop_backpressure
+        + summary.cause_counts.air_loss
+        + summary.cause_counts.generator_missed
+        + summary.cause_counts.ambiguous;
+    assert_eq!(counted, summary.empty_slots);
+
+    // Σ(Δstream − 1) over the empty slots: 2 from the device gap, 1 from the
+    // backpressure gap, 0 from the contiguous ones.
+    assert_eq!(summary.dropped_frames_total, 3);
+    assert_eq!(summary.delta_drop_total, 2);
+    assert_eq!(summary.delta_backpressure_total, 1);
+    assert_eq!(summary.empty_slots_low_rssi, 1);
+
+    // A payload written before `summary` existed still deserializes, with the
+    // field defaulted, so old captures keep loading.
+    let mut value = serde_json::to_value(&data).expect("serialize");
+    let diagnostics = value
+        .get_mut("diagnostics")
+        .and_then(|diagnostics| diagnostics.as_object_mut())
+        .expect("diagnostics object");
+    diagnostics.remove("summary");
+    let restored: VisualizationData = serde_json::from_value(value).expect("deserialize");
+    let restored_trace = restored.diagnostics.as_ref().expect("trace");
+    assert_eq!(restored_trace.summary, Default::default());
+    // The rest of the trace is untouched by the missing field.
+    assert_eq!(restored_trace.records.len(), trace.records.len());
+    assert_eq!(restored_trace.empty_slots.len(), trace.empty_slots.len());
+}

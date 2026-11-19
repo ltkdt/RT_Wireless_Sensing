@@ -61,16 +61,39 @@ A separate canvas behind a bottom toggle, independent of the amplitude heatmap
 each second yield fewer CSI samples than the configured PPS?*
 
 Click a heatmap point to select its second, then enable **Diagnostic view**. The
-canvas draws the `subcarriers × slots` matrix of that second (`slots` = nominal
-PPS rounded once in Rust); empty columns are hatched. Hovering a cell shows a
-one-line identity (`Slot 12/99 · SC 31 — filled (frame #431)`); clicking a cell
-fills the **Timeslot details** box below the canvas, and the **Statistics** box
-shows the per-second numbers.
+panel opens with a **Capture overview** covering the whole trace, followed by the
+**Slot grid — selected second**. The grid draws the `subcarriers × slots` matrix
+of that second (`slots` = nominal PPS rounded once in Rust); empty columns are
+hatched. Hovering a cell shows a one-line identity
+(`Slot 12/99 · SC 31 — filled (frame #431)`); clicking a cell fills the
+**Timeslot details** box below the canvas, and the **Statistics** box shows the
+per-second numbers.
 
 Every value is computed in Rust from the `.bin` capture itself — the 60-byte
 HTTP frame prefix and the 64-byte CSI record header — and shipped in the
 `diagnostics` payload field, so the same numbers can be exported with `--json`
 for offline analysis.
+
+#### Capture overview
+
+The overview aggregates every empty slot of the trace, so it answers *where the
+PPS went* for the whole capture instead of one second at a time. It renders as
+soon as the toggle is on, with or without a selected second, and refreshes on
+every poll.
+
+- **KPI row:** records / total slots, loss %, empty slots, dropped frames,
+  Δ`raw_drop_total`, Δ`raw_send_backpressure_total`.
+- **Donut:** the empty slots split by cause, one fixed colour per cause, with a
+  legend row per cause showing the count and its percentage of the empty slots.
+  `ambiguous` is its own slice, so a live-window edge never distorts the
+  attribution of the other causes.
+- **Tooltips:** hovering a KPI, a legend row or the ⓘ glyph explains the
+  underlying payload field.
+
+Percentages are over the empty slots inside the **covered span** — from the first
+to the last received record. Slots before the first record and after the last one
+are not part of the capture, so they are neither filled nor empty; `capture_end`
+and `seconds[].partial` mark those edges.
 
 #### Payload
 
@@ -82,6 +105,10 @@ for offline analysis.
 | `records[]` | One row per received record: slot, slot offset, Δstream, Δdrop, Δbackpressure, Δticks, Δwifi_rx, RSSI/noise/SNR, flags, channel/PHY/width |
 | `empty_slots[]` | One row per slot without a record: cause, dropped frames, boundary records |
 | `seconds[]` | Per-second statistics: counts, Δtick intervals, bursts, slot offsets, layer counters, radio quality, anomalies |
+| `summary` | Capture-level aggregation for the overview panel: `total_slots`, `filled_records`, `empty_slots`, `loss_ratio`, `cause_counts`, `dropped_frames_total`, `delta_drop_total`, `delta_backpressure_total`, `empty_slots_low_rssi` |
+
+`summary` is `#[serde(default)]`: a payload written before the field existed
+still parses, and the web layer then aggregates `empty_slots` itself.
 
 #### Slot semantics
 

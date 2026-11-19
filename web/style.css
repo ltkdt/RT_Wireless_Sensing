@@ -547,3 +547,164 @@ button:active {
     color: var(--text-muted);
     padding-top: 8px;
 }
+
+/* --- Capture overview (diagnostic panel above the slot grid) --- */
+
+.diag-subheading {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin: 0;
+}
+
+.diag-overview {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    background-color: rgba(15, 23, 42, 0.6);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 12px 14px;
+}
+
+.diag-overview-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.diag-overview-head h3 {
+    font-size: 0.8rem;
+    font-weight: 700;
+    color: var(--accent-amber);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin: 0;
+}
+
+.diag-info {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    border: 1px solid var(--border-color);
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    cursor: help;
+    user-select: none;
+}
+
+.diag-info:hover {
+    color: var(--accent-amber);
+    border-color: var(--accent-amber);
+}
+
+.diag-overview-body {
+    display: flex;
+    align-items: flex-start;
+    gap: 18px;
+    flex-wrap: wrap;
+}
+
+#overviewCanvas {
+    display: block;
+    flex: 0 0 auto;
+}
+
+.diag-overview-side {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    flex: 1 1 320px;
+    min-width: 0;
+}
+
+.diag-kpis {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 8px;
+}
+
+.diag-kpi {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px 8px;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    background-color: rgba(2, 6, 23, 0.5);
+    font-family: var(--font-mono);
+    cursor: help;
+}
+
+.diag-kpi .kpi-label {
+    font-size: 0.66rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.diag-kpi .kpi-value {
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.diag-overview-legend {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.diag-overview-legend-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    cursor: help;
+}
+
+.diag-overview-legend-row .overview-legend-label {
+    flex: 1;
+    min-width: 0;
+}
+
+.diag-overview-legend-row .overview-legend-value {
+    flex: 0 0 auto;
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+/* Tooltip for the overview panel: same look as the slot tooltip. */
+.diag-tooltip {
+    position: absolute;
+    pointer-events: none;
+    background: rgba(15, 23, 42, 0.96);
+    border: 1px solid var(--accent-amber);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    line-height: 1.5;
+    color: var(--text-primary);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+    z-index: 20;
+    display: none;
+    max-width: 420px;
+}
+
+.diag-tooltip .tip-title {
+    font-weight: 700;
+    color: var(--accent-amber);
+}
+
+.diag-tooltip .tip-body {
+    color: var(--text-secondary);
+}

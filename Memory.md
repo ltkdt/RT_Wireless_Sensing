@@ -134,7 +134,7 @@ record, from `device_ticks_us`) plus `amplitude_00..63` and `phase_00..63` —
   (`metadata.nominal_pps` drives the slot count).
 - **Diagnostic view (phase 2, implemented).** `VisualizationData.diagnostics`
   carries `DiagnosticTrace { slots_per_second, origin_ticks, capture_end,
-  records[], empty_slots[], seconds[] }`. Invariants worth keeping:
+  records[], empty_slots[], seconds[], summary }`. Invariants worth keeping:
   - Slot assignment is integer math on device ticks
     (`within_us * slots / 1_000_000`), the exact form of the browser occupancy
     formula `floor((t − second_start) * slots + 1e-6)`; a test asserts both agree
@@ -147,6 +147,12 @@ record, from `device_ticks_us`) plus `amplitude_00..63` and `phase_00..63` —
     `seconds[].partial` marks a second the trace does not fully cover.
   - Offline files need `--pps` (`from_file_with_pps`); without it the grid falls
     back to `effective_pps` and shrinks exactly for the seconds that miss samples.
+  - `summary` (capture overview) covers the **covered span only** — first to last
+    received record — so `total_slots == filled_records + empty_slots` and the
+    five `cause_counts` buckets partition `empty_slots`. `ambiguous` absorbs the
+    capture edge and the live-window edge; it is never folded into another cause.
+    The field is `#[serde(default)]`, and the web layer re-aggregates
+    `empty_slots` when it is absent.
   - Cost: a 34 s capture at 100 slots adds ~1 MB of diagnostics to the payload.
 
 ---

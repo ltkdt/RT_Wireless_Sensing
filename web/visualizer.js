@@ -735,6 +735,34 @@ const CAUSE_LAYERS = {
     ambiguous: ''
 };
 
+// Fixed colour per cause, shared by the donut slices and the legend swatches.
+const CAUSE_COLORS = {
+    device_drop: '#f87171',
+    desktop_backpressure: '#fbbf24',
+    air_loss: '#c084fc',
+    generator_missed: '#38bdf8',
+    ambiguous: '#64748b'
+};
+
+// One-line meanings for the capture-overview panel, rendered into `data-tip`
+// attributes and shown by the delegated tooltip listener.
+const OVERVIEW_TIPS = {
+    summary: 'diagnostics.summary — capture-level aggregation of all empty slots between the first and last received record, precomputed in Rust',
+    loss_ratio: 'empty slots / total covered slots over the whole capture',
+    device_drop: 'Δstream gap + Δraw_drop_total > 0 — RX device dropped the record before sending (queue full / invalid / batch failed)',
+    desktop_backpressure: 'Δstream gap + Δbackpressure > 0 — desktop client did not accept the batch; measured at the device socket, caused on the desktop',
+    air_loss: 'contiguous counters + neighbouring RSSI ≤ LOW_RSSI_THRESHOLD_DBM (−70 dBm) — lost over the air, TX (AP) → RX',
+    generator_missed: 'contiguous counters + normal RSSI — marker not sent / firmware produced no CSI',
+    ambiguous: 'no boundary record closes the gap — capture end or live window edge',
+    dropped_frames_total: 'Σ (Δstream − 1): packets offered to the stream but never received',
+    delta_drop_total: 'total Δraw_drop_total — RX-side drops (records never left the device)',
+    delta_backpressure_total: 'total Δraw_send_backpressure_total — batches the desktop did not accept',
+    filled_records: 'records received inside the covered span',
+    empty_slots: 'slots inside the covered span without a record',
+    total_slots: 'covered span in slots: filled records + empty slots',
+    empty_slots_low_rssi: 'empty slots classified as over-air loss (low neighbouring RSSI)'
+};
+
 // Code tables mirrored from `csi_header.rs`.
 const PHY_NAMES = {
     0: 'unknown', 1: 'legacy', 2: 'ht', 3: 'vht', 4: 'he-su', 5: 'he-mu', 6: 'he-ersu', 7: 'he-tb'
@@ -778,6 +806,13 @@ class DiagnosticView {
         this.legend = document.getElementById('slotLegend');
         this.legendFilled = document.getElementById('legendFilledSwatch');
         this.hint = document.getElementById('diagnosticHint');
+        // Capture-overview panel (above the slot grid).
+        this.overviewBox = document.getElementById('diagOverviewBox');
+        this.overviewCanvas = document.getElementById('overviewCanvas');
+        this.overviewCtx = this.overviewCanvas ? this.overviewCanvas.getContext('2d') : null;
+        this.overviewKpis = document.getElementById('overviewKpis');
+        this.overviewLegend = document.getElementById('overviewLegend');
+        this.overviewTooltip = document.getElementById('overviewTooltip');
         this.data = null;
         this.enabled = false;
         this.selection = null;  // occupancy object of the selected second
@@ -798,6 +833,12 @@ class DiagnosticView {
             this.canvas.addEventListener('mousemove', (e) => this.onMouseMove(e));
             this.canvas.addEventListener('mouseleave', () => this.hideTooltip());
             this.canvas.addEventListener('click', (e) => this.onSlotClick(e));
+        }
+        // One delegated listener for the whole overview panel: every KPI row,
+        // legend row and the info glyph carries a `data-tip` key.
+        if (this.overviewBox) {
+            this.overviewBox.addEventListener('mouseover', (e) => this.onOverviewOver(e));
+            this.overviewBox.addEventListener('mouseout', (e) => this.onOverviewOut(e));
         }
         window.addEventListener('resize', () => this.render());
     }
@@ -892,10 +933,197 @@ class DiagnosticView {
         return diag.seconds.find((s) => s.second === second) || null;
     }
 
+    // Capture-level summary: the Rust `diagnostics.summary` block, or a
+    // client-side aggregation of `empty_slots` for payloads written before the
+    // block existed. Independent of the selected second.
+    overviewSummary() {
+        const diag = this.data && this.data.diagnostics;
+        if (!diag) return null;
+        if (diag.summary && typeof diag.summary === 'object') return diag.summary;
+
+        // Fallback: aggregate the empty slots the payload already carries.
+        const counts = {
+            device_drop: 0, desktop_backpressure: 0, air_loss: 0,
+            generator_missed: 0, ambiguous: 0
+        };
+        let dropped = 0;
+        let drop = 0;
+        let backpressure = 0;
+        let lowRssi = 0;
+        const empties = Array.isArray(diag.empty_slots) ? diag.empty_slots : [];
+        for (const empty of empties) {
+            if (counts[empty.cause] !== undefined) counts[empty.cause] += 1;
+            dropped += empty.dropped_frames || 0;
+            drop += empty.delta_drop || 0;
+            backpressure += empty.delta_backpressure || 0;
+            if (empty.cause === 'air_loss') lowRssi += 1;
+        }
+        const filled = Array.isArray(diag.records) ? diag.records.length : 0;
+        const total = filled + empties.length;
+        return {
+            total_slots: total,
+            filled_records: filled,
+            empty_slots: empties.length,
+            loss_ratio: total > 0 ? empties.length / total : 0,
+            cause_counts: counts,
+            dropped_frames_total: dropped,
+            delta_drop_total: drop,
+            delta_backpressure_total: backpressure,
+            empty_slots_low_rssi: lowRssi
+        };
+    }
+
+    // Renders the capture overview: KPI rows + donut of the cause split.
+    renderOverview() {
+        if (!this.overviewBox) return;
+        const summary = this.enabled ? this.overviewSummary() : null;
+        this.overviewBox.hidden = !summary;
+        if (!summary) return;
+
+        const counts = summary.cause_counts || {};
+        const emptyTotal = summary.empty_slots || 0;
+        const pct = (value) => (emptyTotal > 0 ? (value / emptyTotal) * 100 : 0);
+
+        if (this.overviewKpis) {
+            const kpis = [
+                ['records / slots', `${summary.filled_records} / ${summary.total_slots}`, 'filled_records'],
+                ['loss', `${(summary.loss_ratio * 100).toFixed(1)} %`, 'loss_ratio'],
+                ['empty slots', `${summary.empty_slots}`, 'empty_slots'],
+                ['dropped frames', `${summary.dropped_frames_total}`, 'dropped_frames_total'],
+                ['Δraw_drop_total', `${summary.delta_drop_total}`, 'delta_drop_total'],
+                ['Δbackpressure', `${summary.delta_backpressure_total}`, 'delta_backpressure_total']
+            ];
+            this.overviewKpis.innerHTML = kpis
+                .map(([label, value, tip]) => `<div class="diag-kpi" data-tip="${tip}">`
+                    + `<span class="kpi-label">${label}</span>`
+                    + `<span class="kpi-value">${value}</span></div>`)
+                .join('');
+        }
+
+        if (this.overviewLegend) {
+            const order = ['device_drop', 'desktop_backpressure', 'air_loss', 'generator_missed', 'ambiguous'];
+            this.overviewLegend.innerHTML = order
+                .map((cause) => {
+                    const value = counts[cause] || 0;
+                    const layer = CAUSE_LAYERS[cause];
+                    const tag = layer ? ` <span class="tip-layer ${layer}">${layer}</span>` : '';
+                    return `<div class="diag-overview-legend-row" data-tip="${cause}">`
+                        + `<span class="legend-swatch" style="background:${CAUSE_COLORS[cause]}"></span>`
+                        + `<span class="overview-legend-label">${CAUSE_LABELS[cause]}${tag}</span>`
+                        + `<span class="overview-legend-value">${value} · ${pct(value).toFixed(1)} %</span>`
+                        + `</div>`;
+                })
+                .join('');
+        }
+
+        this.drawOverviewDonut(counts, emptyTotal, summary);
+    }
+
+    // Donut of the cause split. Slices are drawn from the top, clockwise, in a
+    // fixed order so the colours stay stable across polls.
+    drawOverviewDonut(counts, emptyTotal, summary) {
+        if (!this.overviewCanvas || !this.overviewCtx) return;
+        const canvas = this.overviewCanvas;
+        const ctx = this.overviewCtx;
+        const dpr = window.devicePixelRatio || 1;
+        const size = 200;
+        canvas.width = Math.round(size * dpr);
+        canvas.height = Math.round(size * dpr);
+        canvas.style.width = `${size}px`;
+        canvas.style.height = `${size}px`;
+
+        ctx.save();
+        ctx.scale(dpr, dpr);
+        ctx.clearRect(0, 0, size, size);
+
+        const cx = size / 2;
+        const cy = size / 2;
+        const outer = size / 2 - 6;
+        const inner = outer * 0.58;
+
+        if (emptyTotal === 0) {
+            ctx.beginPath();
+            ctx.arc(cx, cy, (outer + inner) / 2, 0, Math.PI * 2);
+            ctx.strokeStyle = '#334155';
+            ctx.lineWidth = outer - inner;
+            ctx.stroke();
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '600 12px ui-monospace, monospace';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('no empty slots', cx, cy);
+            ctx.restore();
+            return;
+        }
+
+        const order = ['device_drop', 'desktop_backpressure', 'air_loss', 'generator_missed', 'ambiguous'];
+        let start = -Math.PI / 2;
+        for (const cause of order) {
+            const value = counts[cause] || 0;
+            if (value <= 0) continue;
+            const sweep = (value / emptyTotal) * Math.PI * 2;
+            ctx.beginPath();
+            ctx.arc(cx, cy, outer, start, start + sweep);
+            ctx.arc(cx, cy, inner, start + sweep, start, true);
+            ctx.closePath();
+            ctx.fillStyle = CAUSE_COLORS[cause];
+            ctx.fill();
+            start += sweep;
+        }
+
+        // Centre readout: the loss ratio is the headline number.
+        const total = (summary.total_slots || 0) || (emptyTotal + (summary.filled_records || 0));
+        const lossPct = total > 0 ? (emptyTotal / total) * 100 : 0;
+        ctx.fillStyle = '#e2e8f0';
+        ctx.font = '700 20px ui-monospace, monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`${lossPct.toFixed(0)}%`, cx, cy - 6);
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '600 10px ui-monospace, monospace';
+        ctx.fillText('empty', cx, cy + 12);
+        ctx.restore();
+    }
+
+    // Delegated hover: any element with `data-tip` inside the overview panel.
+    onOverviewOver(event) {
+        const target = event.target.closest('[data-tip]');
+        if (!target || !this.overviewTooltip || !this.overviewBox) return;
+        const tip = OVERVIEW_TIPS[target.dataset.tip];
+        if (!tip) return;
+        this.overviewTooltip.innerHTML = `<div class="tip-title">${target.dataset.tip}</div>`
+            + `<div class="tip-body">${tip}</div>`;
+        this.overviewTooltip.style.display = 'block';
+
+        const boxRect = this.overviewBox.getBoundingClientRect();
+        const targetRect = target.getBoundingClientRect();
+        let left = targetRect.left - boxRect.left;
+        let top = targetRect.bottom - boxRect.top + 6;
+        const tw = this.overviewTooltip.offsetWidth;
+        const th = this.overviewTooltip.offsetHeight;
+        if (left + tw > boxRect.width - 8) left = boxRect.width - tw - 8;
+        if (top + th > boxRect.height - 8) top = targetRect.top - boxRect.top - th - 6;
+        this.overviewTooltip.style.left = `${Math.max(4, left)}px`;
+        this.overviewTooltip.style.top = `${Math.max(4, top)}px`;
+    }
+
+    onOverviewOut(event) {
+        if (!this.overviewTooltip) return;
+        const target = event.target.closest('[data-tip]');
+        if (!target) return;
+        const next = event.relatedTarget;
+        if (next && target.contains(next)) return;
+        this.overviewTooltip.style.display = 'none';
+    }
+
     render() {
         if (!this.canvas || !this.ctx) return;
         const hasSelection = this.enabled && !!this.data && !!this.selection
             && Array.isArray(this.data.timestamps) && this.data.timestamps.length > 0;
+
+        // The capture overview covers the whole trace, so it renders as soon as
+        // the toggle is on, with or without a selected second.
+        this.renderOverview();
 
         if (this.wrapper) this.wrapper.hidden = !hasSelection;
         if (this.legend) this.legend.hidden = !hasSelection;
@@ -997,12 +1225,17 @@ class DiagnosticView {
         for (let s = 0; s < slots; s++) {
             if (grid[s] !== null) continue;
             const x0 = plotX + s * colW;
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(x0, plotY, colW, plotH);
+            ctx.clip();
             ctx.beginPath();
             for (let d = -plotH; d < colW + plotH; d += 8) {
                 ctx.moveTo(x0 + d, plotY + plotH);
                 ctx.lineTo(x0 + d + plotH, plotY);
             }
             ctx.stroke();
+            ctx.restore();
         }
         ctx.restore();
 
