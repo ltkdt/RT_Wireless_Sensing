@@ -5,11 +5,13 @@ obvious from any single source file. Per-module usage and API reference live in
 `docs_EN/` (English) and `docs_VN/` (Vietnamese) and in rustdoc — do not duplicate
 them here. This file is not a changelog.
 
-> `PLAN.md` is **deprecated**. It planned the DSP rewrite, which is implemented in
-> `src/dsp/` and documented in `docs_EN/dsp.md` / `docs_VN/dsp.md`. Do not follow it.
+> `PLAN.md` holds the current feature plan: the **Diagnostic view** for the
+> visualization module (PPS-deficit diagnosis, approved 2026-11-19). The old
+> DSP-rewrite plan is obsolete — DSP is implemented in `src/dsp/` and documented in
+> `docs_EN/dsp.md` / `docs_VN/dsp.md`.
 
-Last updated: 2026-11-18 (rewritten: implemented features removed since they are in
-the docs; kept design decisions + verified facts; added collection `max_duration`)
+Last updated: 2026-11-19 (PLAN.md now points to the approved Diagnostic-view plan;
+removed the stale "PLAN.md is deprecated" note)
 
 ---
 
