@@ -94,7 +94,9 @@ The repository's `capture_v8.bin` decodes to 691 records and produces
 `129` arrays of length `691`.
 
 An example of the Web UI interface during streaming:
-![plot_ui](/plot_data/example_UI.png)
+![plot_ui](/gallery/example_UI.png)
+Inspecting records:
+![diagnostic_view](/gallery/diagnostic_view.png)
 
 ## Documentation
 
