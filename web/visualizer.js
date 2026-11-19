@@ -72,6 +72,11 @@ const COLORMAP_LUTS = {
     jet: generateColormapLUT(COLORMAPS.jet)
 };
 
+// Last-resort fallback only: Rust always sends metadata.subcarriers, and the
+// static label in index.html keeps "64 subcarriers / frame" as its fallback
+// text. All rendering paths must prefer metadata.subcarriers.
+const FALLBACK_SUBCARRIERS = 64;
+
 // --- Heatmap Visualizer Class ---
 class CsiVisualizer {
     constructor(canvasId) {
@@ -84,6 +89,7 @@ class CsiVisualizer {
         this.maxAmp = 100;
         this.hoverState = null;
         this.occupancy = null;
+        this.diagnosticView = null;
         this.offscreenCanvas = document.createElement('canvas');
         this.offscreenCtx = this.offscreenCanvas.getContext('2d');
 
@@ -104,6 +110,10 @@ class CsiVisualizer {
         this.updateMetadataUI();
         this.refreshOccupancy();
         this.render();
+        if (this.diagnosticView) {
+            this.diagnosticView.setData(data);
+            this.diagnosticView.setSelection(this.occupancy);
+        }
     }
 
     calculateBounds() {
@@ -137,6 +147,20 @@ class CsiVisualizer {
         const measured = meta && Number.isFinite(meta.effective_pps) ? meta.effective_pps : 0;
         const pps = Math.round(configured > 0 ? configured : measured);
         return Math.max(1, Math.min(pps || 1, 100000));
+    }
+
+    // Subcarrier count per frame. Rust always sends metadata.subcarriers;
+    // the fallbacks keep old payloads and the static label working.
+    getSubcarrierCount() {
+        if (!this.data) return FALLBACK_SUBCARRIERS;
+        const meta = this.data.metadata;
+        if (meta && Number.isFinite(meta.subcarriers) && meta.subcarriers > 0) {
+            return meta.subcarriers;
+        }
+        if (this.data.amplitudes && this.data.amplitudes[0]) {
+            return this.data.amplitudes[0].length;
+        }
+        return FALLBACK_SUBCARRIERS;
     }
 
     // Occupancy for the second [secondStart, secondStart + 1):
@@ -223,6 +247,10 @@ class CsiVisualizer {
         setElem('metaDuration', `${meta.duration_seconds.toFixed(2)} s`);
         setElem('metaFrames', `${meta.total_frames.toLocaleString()} frames`);
         setElem('metaRate', `${meta.effective_pps.toFixed(2)} PPS`);
+        setElem(
+            'metaSubcarriers',
+            `${Number.isFinite(meta.subcarriers) && meta.subcarriers > 0 ? meta.subcarriers : FALLBACK_SUBCARRIERS} subcarriers / frame`
+        );
 
         // Classification Card
         const classBadge = document.getElementById('classificationBadge');
@@ -352,7 +380,7 @@ class CsiVisualizer {
             ? timestamps[timestamps.length - 1]
             : (this.data.metadata.duration_seconds || 0);
         const timeSpan = Math.max(tMax - tMin, 1e-9);
-        const subcarrierCount = this.data.metadata.subcarriers || 64;
+        const subcarrierCount = this.getSubcarrierCount();
 
         this.ctx.fillStyle = '#94a3b8';
         this.ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
@@ -553,8 +581,7 @@ class CsiVisualizer {
         }
 
         const numFrames = this.data.amplitudes.length;
-        const numSubcarriers = this.data.metadata.subcarriers
-            || (this.data.amplitudes[0] ? this.data.amplitudes[0].length : 64);
+        const numSubcarriers = this.getSubcarrierCount();
 
         const fracX = (mouseX - px) / pw;
         const fracY = (mouseY - py) / ph;
@@ -626,6 +653,8 @@ class CsiVisualizer {
             this.updateHoverReadout(point);
             this.occupancy = this.computeOccupancy(Math.floor(point.timeSec));
             this.updateOccupancyUI();
+            // The diagnostic view reuses this same click-to-select-second.
+            if (this.diagnosticView) this.diagnosticView.setSelection(this.occupancy);
             this.render();
         });
 
@@ -643,6 +672,7 @@ class CsiVisualizer {
             colormapSelect.addEventListener('change', (e) => {
                 this.colormap = e.target.value;
                 this.render();
+                if (this.diagnosticView) this.diagnosticView.render();
             });
         }
 
@@ -678,9 +708,651 @@ class CsiVisualizer {
     }
 }
 
+// --- Diagnostic View ---
+//
+// Separate canvas behind a bottom toggle, independent of the amplitude
+// heatmap (which is untouched while the toggle is off). The toggle is only
+// offered when the payload carries a `diagnostics` field; old payloads keep
+// it hidden. Rust assigns every record to a slot and precomputes the deltas,
+// the empty-slot classification, and the per-second statistics, so this view
+// only formats numbers: filled columns use the amplitude colormap, empty
+// columns render hatched gray.
+
+// Empty-slot causes, as serialized by `DiagnosticCause` in Rust.
+const CAUSE_LABELS = {
+    device_drop: 'dropped at the device stream layer — RX (device)',
+    desktop_backpressure: 'the desktop did not accept the batch — desktop reads too slowly',
+    air_loss: 'lost over the air — TX (AP) → RX airtime',
+    generator_missed: 'no record generated — generator (desktop) or firmware',
+    ambiguous: 'cannot attribute — no boundary record on one side'
+};
+
+const CAUSE_LAYERS = {
+    device_drop: 'rx',
+    desktop_backpressure: 'desktop',
+    air_loss: 'tx',
+    generator_missed: 'generator',
+    ambiguous: ''
+};
+
+// Code tables mirrored from `csi_header.rs`.
+const PHY_NAMES = {
+    0: 'unknown', 1: 'legacy', 2: 'ht', 3: 'vht', 4: 'he-su', 5: 'he-mu', 6: 'he-ersu', 7: 'he-tb'
+};
+const WIDTH_NAMES = { 0: 'unknown', 1: '20', 2: '40', 3: '80', 4: '160', 5: '80+80' };
+const FLAG_LABELS = [
+    [1, 'first-word-invalid'],
+    [2, 'rx-ts-valid'],
+    [4, 'rx-start-ts-valid'],
+    [8, 'fresh']
+];
+
+// `null`/`undefined` render as an em dash instead of "null".
+function orDash(value) {
+    return value === null || value === undefined ? '—' : value;
+}
+
+function flagLabels(flags) {
+    const labels = FLAG_LABELS.filter(([bit]) => (flags & bit) !== 0).map(([, label]) => label);
+    return labels.length > 0 ? labels.join(' · ') : 'none';
+}
+
+function boundaryText(boundary) {
+    return boundary
+        ? `#${boundary.frame} · seq ${boundary.seq_num} · ${boundary.device_ticks_us} µs · ${boundary.rssi_dbm} dBm`
+        : '— (none in this trace)';
+}
+
+class DiagnosticView {
+    constructor(visualizer) {
+        this.visualizer = visualizer;
+        this.canvas = document.getElementById('slotCanvas');
+        this.ctx = this.canvas ? this.canvas.getContext('2d') : null;
+        this.tooltip = document.getElementById('slotTooltip');
+        this.section = document.getElementById('diagnosticSection');
+        this.toggleBar = document.getElementById('diagnosticToggleBar');
+        this.toggle = document.getElementById('diagnosticToggle');
+        this.wrapper = document.getElementById('slotCanvasWrapper');
+        this.statsBox = document.getElementById('diagStatsBox');
+        this.detailsBox = document.getElementById('diagDetailsBox');
+        this.legend = document.getElementById('slotLegend');
+        this.legendFilled = document.getElementById('legendFilledSwatch');
+        this.hint = document.getElementById('diagnosticHint');
+        this.data = null;
+        this.enabled = false;
+        this.selection = null;  // occupancy object of the selected second
+        this.slotGrid = null;   // { secondStart, slots, grid: (frameIdx|null)[] }
+        this.selectedCell = null; // { slot, sc } clicked cell shown in the details box
+        this.plotBounds = null;
+        this.margin = { top: 44, right: 18, bottom: 50, left: 58 };
+        this.offscreen = document.createElement('canvas');
+        this.offCtx = this.offscreen.getContext('2d');
+        this.initEvents();
+    }
+
+    initEvents() {
+        if (this.toggle) {
+            this.toggle.addEventListener('change', (e) => this.setEnabled(e.target.checked));
+        }
+        if (this.canvas) {
+            this.canvas.addEventListener('mousemove', (e) => this.onMouseMove(e));
+            this.canvas.addEventListener('mouseleave', () => this.hideTooltip());
+            this.canvas.addEventListener('click', (e) => this.onSlotClick(e));
+        }
+        window.addEventListener('resize', () => this.render());
+    }
+
+    // The toggle is only offered when the payload has a `diagnostics` field.
+    setData(data) {
+        this.data = data;
+        const hasDiagnostics = !!(data && data.diagnostics);
+        if (this.toggleBar) this.toggleBar.hidden = !hasDiagnostics;
+        if (!hasDiagnostics) this.setEnabled(false);
+        this.render();
+    }
+
+    // Reuses the heatmap's click-to-select-second (the occupancy object).
+    setSelection(occupancy) {
+        const previousSecond = this.selection ? this.selection.secondStart : null;
+        const nextSecond = occupancy ? occupancy.secondStart : null;
+        if (previousSecond !== nextSecond) this.selectedCell = null;
+        this.selection = occupancy;
+        this.render();
+    }
+
+    setEnabled(on) {
+        this.enabled = on;
+        if (this.toggle) this.toggle.checked = on;
+        if (this.section) this.section.hidden = !on;
+        if (!on) this.hideTooltip();
+        this.render();
+    }
+
+    // Column count of the slot grid: Rust rounds the nominal PPS once and
+    // passes it explicitly in the diagnostics payload.
+    slotsPerSecond() {
+        const diag = this.data && this.data.diagnostics;
+        if (diag && Number.isFinite(diag.slots_per_second) && diag.slots_per_second > 0) {
+            return Math.round(diag.slots_per_second);
+        }
+        return this.visualizer.getNominalPps();
+    }
+
+    // Slot grid of the selected second. Rust assigns every record to a slot
+    // (`second` + `slot` in the diagnostics payload), so the grid is read
+    // straight from the trace; payloads without records fall back to the same
+    // arithmetic as computeOccupancy: slot = floor((t - secondStart) * slots + 1e-6).
+    computeSlotGrid(secondStart) {
+        const slots = this.slotsPerSecond();
+        const second = Math.round(secondStart);
+        const grid = new Array(slots).fill(null);
+        const diag = this.data && this.data.diagnostics;
+
+        if (diag && Array.isArray(diag.records) && diag.records.length > 0) {
+            for (const record of diag.records) {
+                if (record.second !== second) continue;
+                if (record.slot >= 0 && record.slot < slots && grid[record.slot] === null) {
+                    grid[record.slot] = record.frame;
+                }
+            }
+            return { secondStart, second, slots, grid };
+        }
+
+        const timestamps = this.data.timestamps || [];
+        for (let i = 0; i < timestamps.length; i++) {
+            const t = timestamps[i];
+            if (t >= secondStart && t < secondStart + 1) {
+                let slot = Math.floor((t - secondStart) * slots + 1e-6);
+                if (slot < 0) slot = 0;
+                if (slot >= slots) slot = slots - 1;
+                if (grid[slot] === null) grid[slot] = i;
+            }
+        }
+        return { secondStart, second, slots, grid };
+    }
+
+    // Record of one (second, slot) cell, or null when the slot is empty.
+    recordAt(second, slot) {
+        const diag = this.data && this.data.diagnostics;
+        if (!diag || !Array.isArray(diag.records)) return null;
+        return diag.records.find((r) => r.second === second && r.slot === slot) || null;
+    }
+
+    // Rust classification of one empty slot, or null when it is not in the trace.
+    emptySlotAt(second, slot) {
+        const diag = this.data && this.data.diagnostics;
+        if (!diag || !Array.isArray(diag.empty_slots)) return null;
+        return diag.empty_slots.find((e) => e.second === second && e.slot === slot) || null;
+    }
+
+    // Per-second statistics computed in Rust.
+    secondStats(second) {
+        const diag = this.data && this.data.diagnostics;
+        if (!diag || !Array.isArray(diag.seconds)) return null;
+        return diag.seconds.find((s) => s.second === second) || null;
+    }
+
+    render() {
+        if (!this.canvas || !this.ctx) return;
+        const hasSelection = this.enabled && !!this.data && !!this.selection
+            && Array.isArray(this.data.timestamps) && this.data.timestamps.length > 0;
+
+        if (this.wrapper) this.wrapper.hidden = !hasSelection;
+        if (this.legend) this.legend.hidden = !hasSelection;
+        if (this.statsBox) this.statsBox.hidden = !hasSelection;
+
+        if (!hasSelection) {
+            this.slotGrid = null;
+            if (this.hint) {
+                this.hint.textContent = this.enabled
+                    ? 'Click the heatmap above to select a second.'
+                    : '';
+            }
+            this.renderDetails();
+            return;
+        }
+
+        this.slotGrid = this.computeSlotGrid(this.selection.secondStart);
+        if (this.hint) {
+            const filled = this.slotGrid.grid.filter((value) => value !== null).length;
+            this.hint.textContent =
+                `Selected second ${this.selection.secondStart} s — ${filled}/${this.slotGrid.slots} slots filled.`;
+        }
+        this.drawSlotGrid();
+        this.renderStats();
+        this.renderDetails();
+    }
+
+    drawSlotGrid() {
+        const { slots, grid } = this.slotGrid;
+        const scCount = this.visualizer.getSubcarrierCount();
+        const amps = this.data.amplitudes;
+
+        // Offscreen buffer: one pixel per (slot, subcarrier); subcarrier 0 at
+        // the bottom row, matching the main heatmap orientation.
+        this.offscreen.width = slots;
+        this.offscreen.height = scCount;
+        const img = this.offCtx.createImageData(slots, scCount);
+        const px = img.data;
+        const lut = COLORMAP_LUTS[this.visualizer.colormap] || COLORMAP_LUTS.viridis;
+        const range = (this.visualizer.maxAmp - this.visualizer.minAmp) || 1;
+        const EMPTY = [51, 65, 85];
+
+        for (let s = 0; s < slots; s++) {
+            const frameIdx = grid[s];
+            for (let sc = 0; sc < scCount; sc++) {
+                const py = scCount - 1 - sc;
+                const pIdx = (py * slots + s) * 4;
+                if (frameIdx === null) {
+                    px[pIdx] = EMPTY[0];
+                    px[pIdx + 1] = EMPTY[1];
+                    px[pIdx + 2] = EMPTY[2];
+                    px[pIdx + 3] = 255;
+                } else {
+                    const amp = amps[frameIdx][sc];
+                    const norm = Math.max(0, Math.min(1, (amp - this.visualizer.minAmp) / range));
+                    const lutIdx = Math.floor(norm * 255) * 3;
+                    px[pIdx] = lut[lutIdx];
+                    px[pIdx + 1] = lut[lutIdx + 1];
+                    px[pIdx + 2] = lut[lutIdx + 2];
+                    px[pIdx + 3] = 255;
+                }
+            }
+        }
+        this.offCtx.putImageData(img, 0, 0);
+
+        const rect = this.canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const width = Math.max(600, rect.width || 1200);
+        const height = Math.max(220, Math.round(width * 0.25));
+        this.canvas.width = Math.round(width * dpr);
+        this.canvas.height = Math.round(height * dpr);
+        this.canvas.style.height = `${height}px`;
+
+        const ctx = this.ctx;
+        ctx.save();
+        ctx.scale(dpr, dpr);
+        ctx.fillStyle = '#0b1120';
+        ctx.fillRect(0, 0, width, height);
+
+        const m = this.margin;
+        const plotX = m.left;
+        const plotY = m.top;
+        const plotW = width - m.left - m.right;
+        const plotH = height - m.top - m.bottom;
+        this.plotBounds = { x: plotX, y: plotY, w: plotW, h: plotH, width, height };
+
+        // Matrix (nearest-neighbour so individual slots stay visible).
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(plotX, plotY, plotW, plotH);
+        ctx.clip();
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(this.offscreen, plotX, plotY, plotW, plotH);
+
+        // Hatch empty columns so they render distinctly from filled ones.
+        ctx.strokeStyle = 'rgba(148, 163, 184, 0.55)';
+        ctx.lineWidth = 1;
+        const colW = plotW / slots;
+        for (let s = 0; s < slots; s++) {
+            if (grid[s] !== null) continue;
+            const x0 = plotX + s * colW;
+            ctx.beginPath();
+            for (let d = -plotH; d < colW + plotH; d += 8) {
+                ctx.moveTo(x0 + d, plotY + plotH);
+                ctx.lineTo(x0 + d + plotH, plotY);
+            }
+            ctx.stroke();
+        }
+        ctx.restore();
+
+        ctx.strokeStyle = '#334155';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(plotX, plotY, plotW, plotH);
+
+        // Title
+        const filled = grid.filter((v) => v !== null).length;
+        ctx.fillStyle = '#f8fafc';
+        ctx.font = '600 14px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'bottom';
+        ctx.fillText(
+            `Slot grid — second ${this.slotGrid.secondStart} s (${filled}/${slots} slots filled)`,
+            plotX,
+            plotY - 12
+        );
+
+        this.drawSlotAxes(plotX, plotY, plotW, plotH, scCount);
+        ctx.restore();
+
+        // The legend is DOM above the canvas, so it never covers the matrix;
+        // keep its filled swatch on the active colormap.
+        if (this.legendFilled) {
+            this.legendFilled.style.background =
+                `rgb(${lut[255 * 3]}, ${lut[255 * 3 + 1]}, ${lut[255 * 3 + 2]})`;
+        }
+    }
+
+    drawSlotAxes(px, py, pw, ph, scCount) {
+        const slots = this.slotGrid.slots;
+        const ctx = this.ctx;
+
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+
+        // X axis: slot indices, thinned out when there are many slots.
+        const step = Math.max(1, Math.ceil(slots / 20));
+        for (let s = 0; s < slots; s += step) {
+            const x = px + ((s + 0.5) / slots) * pw;
+            ctx.beginPath();
+            ctx.moveTo(x, py + ph);
+            ctx.lineTo(x, py + ph + 4);
+            ctx.strokeStyle = '#475569';
+            ctx.stroke();
+            ctx.fillText(`${s}`, x, py + ph + 7);
+        }
+        ctx.fillStyle = '#f8fafc';
+        ctx.font = '500 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+        ctx.fillText(`Slot index (of ${slots} per second)`, px + pw / 2, py + ph + 26);
+
+        // Y axis: subcarrier index, 0 at the bottom.
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
+        const yTicks = scCount > 1 ? [0, Math.floor((scCount - 1) / 2), scCount - 1] : [0];
+        for (const sc of yTicks) {
+            const frac = scCount > 1 ? sc / (scCount - 1) : 0;
+            const y = py + ph - frac * ph;
+            ctx.beginPath();
+            ctx.moveTo(px - 4, y);
+            ctx.lineTo(px, y);
+            ctx.strokeStyle = '#475569';
+            ctx.stroke();
+            ctx.fillText(`${sc}`, px - 7, y);
+        }
+        ctx.save();
+        ctx.translate(px - 40, py + ph / 2);
+        ctx.rotate(-Math.PI / 2);
+        ctx.fillStyle = '#f8fafc';
+        ctx.font = '500 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+        ctx.fillText('Subcarrier Index', 0, 0);
+        ctx.restore();
+    }
+
+    eventToSlot(e) {
+        if (!this.slotGrid || !this.plotBounds) return null;
+        const rect = this.canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+        const { x: px, y: py, w: pw, h: ph } = this.plotBounds;
+        if (mx < px || mx > px + pw || my < py || my > py + ph) return null;
+        const slots = this.slotGrid.slots;
+        const scCount = this.visualizer.getSubcarrierCount();
+        const slot = Math.min(slots - 1, Math.max(0, Math.floor(((mx - px) / pw) * slots)));
+        const sc = Math.min(scCount - 1, Math.max(0, Math.floor((1 - (my - py) / ph) * scCount)));
+        return { slot, sc, clientX: e.clientX, clientY: e.clientY };
+    }
+
+    onMouseMove(e) {
+        const hit = this.eventToSlot(e);
+        if (!hit) {
+            this.hideTooltip();
+            return;
+        }
+        this.showTooltip(hit);
+    }
+
+    hideTooltip() {
+        if (this.tooltip) this.tooltip.style.display = 'none';
+    }
+
+    // One-line cell identity shared by the hover tooltip and the details box.
+    cellTitle(slot, sc) {
+        const { slots, grid } = this.slotGrid;
+        const frameIdx = grid[slot];
+        return frameIdx !== null
+            ? `Slot ${slot}/${slots - 1} · SC ${sc} — filled (frame #${frameIdx})`
+            : `Slot ${slot}/${slots - 1} · SC ${sc} — empty`;
+    }
+
+    detailRow(field, meaning, valueHtml, layer) {
+        const layerLabel = {
+            rx: 'RX device',
+            desktop: 'Desktop',
+            tx: 'TX/airtime',
+            stream: 'Stream',
+            generator: 'Generator'
+        }[layer] || '';
+        const tag = layer ? ` <span class="tip-layer ${layer}">${layerLabel}</span>` : '';
+        return `<div class="diag-detail-row"><span class="detail-field">${field}</span>`
+            + `<span class="detail-meaning">${meaning}${tag}</span>`
+            + `<span class="detail-value">${valueHtml}</span></div>`;
+    }
+
+    // Hover tooltip: only the one-line cell identity. The field meanings and
+    // values live in the "Timeslot details" box, filled on click.
+    showTooltip(hit) {
+        if (!this.tooltip || !this.slotGrid) return;
+        this.tooltip.innerHTML = `<div class="tip-title">${this.cellTitle(hit.slot, hit.sc)}</div>`;
+        this.tooltip.style.display = 'block';
+        // Position inside the wrapper (the tooltip is absolutely positioned there).
+        const wrapRect = this.wrapper.getBoundingClientRect();
+        let left = hit.clientX - wrapRect.left + 15;
+        let top = hit.clientY - wrapRect.top + 15;
+        const tw = this.tooltip.offsetWidth;
+        const th = this.tooltip.offsetHeight;
+        if (left + tw > wrapRect.width - 8) left = hit.clientX - wrapRect.left - tw - 10;
+        if (top + th > wrapRect.height - 8) top = hit.clientY - wrapRect.top - th - 10;
+        this.tooltip.style.left = `${Math.max(4, left)}px`;
+        this.tooltip.style.top = `${Math.max(4, top)}px`;
+    }
+
+    // Clicking a cell pins its details in the "Timeslot details" box below the
+    // canvas; the hover tooltip stays a one-line identity.
+    onSlotClick(e) {
+        const hit = this.eventToSlot(e);
+        if (!hit) return;
+        this.selectedCell = { slot: hit.slot, sc: hit.sc };
+        this.renderDetails();
+    }
+
+    // Box between the canvas and the statistics box: the per-field meanings and
+    // values of the clicked cell, styled like the statistics box. Every value
+    // comes from the Rust `DiagnosticRecord` / `DiagnosticEmptySlot` rows.
+    renderDetails() {
+        if (!this.detailsBox) return;
+        const visible = this.enabled && !!this.selectedCell && !!this.slotGrid;
+        this.detailsBox.hidden = !visible;
+        if (!visible) return;
+
+        const { secondStart, second, slots } = this.slotGrid;
+        const { slot, sc } = this.selectedCell;
+        const record = this.recordAt(second, slot);
+        const PH = '<span class="tip-ph">—</span>';
+
+        let html = `<div class="stats-group-title">Timeslot details — ${this.cellTitle(slot, sc)}</div>`;
+        if (record) {
+            const amp = this.data.amplitudes[record.frame]
+                ? this.data.amplitudes[record.frame][sc]
+                : null;
+            const origin = this.data.diagnostics && Number.isFinite(this.data.diagnostics.origin_ticks)
+                ? this.data.diagnostics.origin_ticks
+                : 0;
+            const relative = (record.device_ticks_us - origin) / 1e6;
+            const gap = record.delta_stream !== null && record.delta_stream > 1
+                ? ` (gap of ${record.delta_stream - 1})`
+                : '';
+            html += this.detailRow('record', `run-wide frame index; slot ${slot} of second ${secondStart} s`, `#${record.frame}`);
+            html += this.detailRow('seq_num', 'saturated copy of stream_sequence (cross-check only)', `${record.seq_num}`);
+            html += this.detailRow(
+                'device_ticks_us',
+                'device monotonic clock, µs; slot offset = ticks − slot start (sign = late/early)',
+                `${record.device_ticks_us} µs (${relative.toFixed(6)} s, offset ${record.slot_offset_us} µs)`
+            );
+            html += this.detailRow(
+                'Δticks / Δwifi_rx_ts_us',
+                'intervals vs previous record; stable Δ(driver) with fluctuating Δ(device) ⇒ delay is after the driver',
+                `${orDash(record.delta_ticks_us)} µs / ${orDash(record.delta_wifi_rx_us)} µs`
+            );
+            html += this.detailRow(
+                'Δstream_sequence',
+                'one-based packets offered to the stream, incl. dropped; a gap = lost at the device stream layer',
+                `${orDash(record.delta_stream)}${gap}`,
+                'stream'
+            );
+            html += this.detailRow(
+                'Δraw_drop_total',
+                'records the device did NOT send — queue full / invalid / batch failed; not a desktop receive problem',
+                `${orDash(record.delta_drop)}`,
+                'rx'
+            );
+            html += this.detailRow(
+                'Δraw_send_backpressure_total',
+                'batches the desktop client did not accept — desktop reads too slowly',
+                `${orDash(record.delta_backpressure)}`,
+                'desktop'
+            );
+            html += this.detailRow(
+                'rssi_dbm / noise_floor_dbm / SNR',
+                'per-record radio quality; low neighbouring RSSI hints at TX/airtime loss',
+                `${record.rssi_dbm} / ${orDash(record.noise_floor_dbm)} / ${orDash(record.snr_db)} dB`,
+                'tx'
+            );
+            html += this.detailRow('flags', 'fresh / first-word-invalid / rx-ts-valid labels', flagLabels(record.flags));
+            html += this.detailRow(
+                'channel / phy / width',
+                'normally constant per session; a mid-run change is worth a warning',
+                `${record.channel} / ${PHY_NAMES[record.phy_mode_code] || 'unknown'} / ${WIDTH_NAMES[record.channel_width_code] || 'unknown'} MHz`
+            );
+            html += this.detailRow('amplitude', 'amplitude of the clicked subcarrier', amp !== null ? amp.toFixed(3) : PH);
+        } else {
+            const slotTime = secondStart + slot / slots;
+            const empty = this.emptySlotAt(second, slot);
+            html += this.detailRow('slot time', 'theoretical slot time on the device clock, s', slotTime.toFixed(4));
+            if (empty) {
+                html += this.detailRow(
+                    'classification',
+                    CAUSE_LABELS[empty.cause] || empty.cause,
+                    empty.cause,
+                    CAUSE_LAYERS[empty.cause]
+                );
+                html += this.detailRow(
+                    'dropped frames',
+                    'frames the stream skipped across the gap (Δstream − 1)',
+                    `${empty.dropped_frames}`
+                );
+                html += this.detailRow(
+                    'Δraw_drop_total / Δbackpressure',
+                    'device-side drops vs desktop-side receive failures across the gap',
+                    `${empty.delta_drop} / ${empty.delta_backpressure}`
+                );
+                html += this.detailRow(
+                    'previous record',
+                    'seq_num and device_ticks_us of the record before the slot',
+                    boundaryText(empty.previous)
+                );
+                html += this.detailRow(
+                    'next record',
+                    'seq_num and device_ticks_us of the record after the slot',
+                    boundaryText(empty.next)
+                );
+                // `capture_end` tells a capture edge from a live window edge, so
+                // an unattributable gap is not mistaken for a lost record.
+                if (!empty.next || !empty.previous) {
+                    const captureEnd = !!(this.data.diagnostics && this.data.diagnostics.capture_end);
+                    const edge = !empty.next
+                        ? (captureEnd
+                            ? 'the capture ends here — no record follows'
+                            : 'the live window ends here — the next record is outside the window')
+                        : 'the trace starts here — no record precedes the slot';
+                    html += this.detailRow('edge', 'why the gap cannot be attributed', edge);
+                }
+            } else {
+                html += this.detailRow('classification', 'no diagnostic row for this slot in the payload', PH);
+            }
+        }
+        this.detailsBox.innerHTML = html;
+    }
+
+    // Box 2 — statistics for the selected second, computed in Rust
+    // (`DiagnosticSecondStats`) so the same numbers can be exported.
+    renderStats() {
+        if (!this.statsBox || !this.slotGrid) return;
+        const { secondStart, second, slots } = this.slotGrid;
+        const stats = this.secondStats(second);
+
+        if (!stats) {
+            this.statsBox.innerHTML =
+                `<div class="stats-group-title">Statistics — second ${secondStart} s (${slots} slots)</div>`
+                + '<div class="diag-note">No diagnostic statistics for this second in the payload.</div>';
+            return;
+        }
+
+        const us = (value) => `${Math.round(value)} µs`;
+        const groups = [
+            ['Counts', [
+                ['samples / nominal pps', `${stats.samples} / ${stats.slots}`],
+                ['effective pps of the second', stats.effective_pps.toFixed(2)],
+                ['empty slots', `${stats.empty_slots}`],
+                ['loss ratio', `${(stats.loss_ratio * 100).toFixed(1)}%`]
+            ]],
+            ['Δtick intervals', [
+                ['mean', us(stats.interval_mean_us)],
+                ['median', us(stats.interval_median_us)],
+                ['min', us(stats.interval_min_us)],
+                ['max', us(stats.interval_max_us)],
+                ['std (jitter)', us(stats.interval_std_us)],
+                ['p95 vs nominal', `${us(stats.interval_p95_us)} vs ${us(stats.nominal_interval_us)}`]
+            ]],
+            ['Burst analysis', [
+                ['consecutive empty slots (1 / 2 / 3+)',
+                    `${stats.burst_histogram[0]} / ${stats.burst_histogram[1]} / ${stats.burst_histogram[2]}`],
+                ['longest empty run', `${stats.longest_empty_run}`]
+            ]],
+            ['Slot offset (lateness)', [
+                ['mean', `${stats.offset_mean_us.toFixed(0)} µs`],
+                ['min / max', `${stats.offset_min_us} / ${stats.offset_max_us} µs`]
+            ]],
+            ['Layer counters', [
+                ['Δstream − count (dropped at stream)', `${stats.stream_gap_total}`],
+                ['Δraw_drop_total', `${stats.drop_total}`],
+                ['Δraw_send_backpressure_total', `${stats.backpressure_total}`],
+                ['frames with backpressure > 0', `${stats.backpressure_frames}`]
+            ]],
+            ['Radio quality', [
+                ['min / mean / max RSSI',
+                    `${orDash(stats.rssi_min_dbm)} / ${stats.rssi_mean_dbm === null ? '—' : stats.rssi_mean_dbm.toFixed(1)} / ${orDash(stats.rssi_max_dbm)} dBm`],
+                ['empty slots with low RSSI', `${stats.empty_slots_low_rssi}`]
+            ]],
+            ['Anomalies', [
+                ['records missing FRESH', `${stats.missing_fresh}`],
+                ['first-word-invalid count', `${stats.first_word_invalid}`],
+                ['channel / phy / width changes', `${stats.config_changes}`]
+            ]]
+        ];
+
+        let html = `<div class="stats-group-title">Statistics — second ${secondStart} s (${slots} slots`
+            + `${stats.partial ? ', partial second' : ''})</div>`;
+        for (const [title, rows] of groups) {
+            html += `<div class="stats-group-title" style="color: var(--text-secondary)">${title}</div>`;
+            for (const [label, value] of rows) {
+                html += `<div class="diag-stat"><span class="stat-label">${label}</span>`
+                    + `<span class="stat-value">${value}</span></div>`;
+            }
+        }
+        this.statsBox.innerHTML = html;
+    }
+}
+
 // Global bootstrap
 document.addEventListener('DOMContentLoaded', async () => {
     const visualizer = new CsiVisualizer('heatmapCanvas');
+    visualizer.diagnosticView = new DiagnosticView(visualizer);
     const loadingOverlay = document.getElementById('loadingOverlay');
     const loadingText = document.getElementById('loadingText');
     let hideTimer = null;

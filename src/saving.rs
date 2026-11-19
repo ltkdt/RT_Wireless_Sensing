@@ -50,13 +50,6 @@ use crate::decoder::{CsiPacket, DecodeError, FrameStreamDecoder};
 /// Name of the timestamp array in the archive.
 pub const TIMESTAMP_ARRAY: &str = "timestamp_ms";
 
-/// Number of subcarriers in the standard ESPectre HT20 capture.
-///
-/// The decoder does not assume this value; it uses the record's `num_sc`. This
-/// constant exists so callers can predict that a normal capture yields
-/// `1 + 64 + 64 = 129` arrays.
-pub const STANDARD_SUBCARRIERS: usize = 64;
-
 /// Result of saving one capture.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SaveSummary {

@@ -42,6 +42,16 @@ pub const NOISE_FLOOR_INVALID_DBM: i8 = -128;
 /// bound, and the decoder checks both for clearer errors.
 pub const MAX_PAYLOAD_BYTES: u16 = 512;
 
+/// Number of complex subcarriers in the standard ESPectre HT20 capture.
+///
+/// This schema owns the wire layout, so the canonical subcarrier count lives
+/// here. The decoder does not assume this value — it uses each record's
+/// `num_sc` — but current firmware sends 64, and the payload is already
+/// normalized to the centered 64-subcarrier layout. Modules that need to
+/// predict a normal capture's shape (for example "129 arrays in the `.npz`")
+/// should use this constant instead of duplicating the literal.
+pub const STANDARD_SUBCARRIERS: usize = 64;
+
 // --- Bits of `CsiHeader::flags` (see `RawCsiRecordFlags`) -------------------
 
 /// The hardware marked the first four payload bytes invalid.

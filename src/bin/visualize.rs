@@ -27,6 +27,9 @@ options:
   -o, --output FILE  write standalone HTML dashboard to FILE
                      (default: <stem>_heatmap.html)
   --json FILE        export JSON visualization dataset to FILE
+  --pps PPS          nominal packet rate used for the diagnostic slot grid
+                     (default: measured effective rate, which shrinks the grid
+                     exactly for the seconds that miss samples)
   --serve            start an embedded asynchronous web server
   --port PORT        port for the web server (default: 8080)
   --open             open the generated HTML or web server in default browser
@@ -35,11 +38,12 @@ options:
 ";
 
 /// Parsed command-line options.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 struct Options {
     input: PathBuf,
     output: Option<PathBuf>,
     json_output: Option<PathBuf>,
+    pps: Option<f64>,
     serve: bool,
     port: u16,
     open: bool,
@@ -68,7 +72,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    let data = match VisualizationData::from_file(&options.input) {
+    let data = match VisualizationData::from_file_with_pps(&options.input, options.pps) {
         Ok(data) => data,
         Err(err) => {
             eprintln!(
@@ -149,6 +153,7 @@ where
     let mut input = None;
     let mut output = None;
     let mut json_output = None;
+    let mut pps = None;
     let mut serve = false;
     let mut port = 8080;
     let mut open = false;
@@ -168,6 +173,18 @@ where
                     .next()
                     .ok_or_else(|| "--json requires a path".to_string())?;
                 json_output = Some(PathBuf::from(val));
+            }
+            "--pps" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--pps requires a number".to_string())?;
+                let parsed = val
+                    .parse::<f64>()
+                    .map_err(|_| format!("invalid pps: {val}"))?;
+                if !parsed.is_finite() || parsed <= 0.0 {
+                    return Err(format!("invalid pps: {val}"));
+                }
+                pps = Some(parsed);
             }
             "--serve" => serve = true,
             "--port" => {
@@ -196,6 +213,7 @@ where
         input: input.unwrap_or_else(|| PathBuf::from("capture_v8.bin")),
         output,
         json_output,
+        pps,
         serve,
         port,
         open,

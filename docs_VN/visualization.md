@@ -53,6 +53,86 @@ và biến mất khi giây rời khỏi cửa sổ 30 giây.
 
 Đây là phép tính phía trình duyệt trên `timestamps` hiển thị; không có điểm cuối bổ sung nào liên quan.
 
+### 5. Chế độ chẩn đoán (phân tích thiếu hụt PPS)
+
+Một canvas riêng nằm sau công tắc ở cuối trang, độc lập với heatmap biên độ
+(heatmap không bị ảnh hưởng khi công tắc tắt). Nó trả lời một câu hỏi: *vì sao
+mỗi giây chỉ thu được ít mẫu CSI hơn PPS đã cấu hình?*
+
+Nhấp vào một điểm trên heatmap để chọn giây của điểm đó, rồi bật **Chế độ chẩn
+đoán**. Canvas vẽ ma trận `subcarrier × khe` của giây đó (`khe` = PPS danh định
+được làm tròn một lần trong Rust); các cột trống được gạch chéo. Di chuột lên một
+ô chỉ hiện một dòng định danh (`Slot 12/99 · SC 31 — filled (frame #431)`); nhấp
+vào ô sẽ đổ dữ liệu vào hộp **Chi tiết khe thời gian** bên dưới canvas, còn hộp
+**Thống kê** hiển thị các con số của giây đó.
+
+Mọi giá trị đều được tính trong Rust từ chính tệp `.bin` — tiền tố HTTP 60 byte
+và header bản ghi CSI 64 byte — rồi gửi trong trường `diagnostics` của payload,
+nên có thể xuất cùng các con số đó bằng `--json` để phân tích ngoại tuyến.
+
+#### Payload
+
+| Trường | Ý nghĩa |
+|---|---|
+| `slots_per_second` | Số cột của lưới (PPS danh định làm tròn một lần) |
+| `origin_ticks` | `device_ticks_us` ứng với mốc thời gian `0.0` |
+| `capture_end` | `true` với tệp ngoại tuyến, `false` với biên cửa sổ trực tiếp |
+| `records[]` | Một dòng cho mỗi bản ghi nhận được: khe, độ lệch khe, Δstream, Δdrop, Δbackpressure, Δticks, Δwifi_rx, RSSI/noise/SNR, flags, kênh/PHY/độ rộng |
+| `empty_slots[]` | Một dòng cho mỗi khe không có bản ghi: nguyên nhân, số khung bị mất, bản ghi biên |
+| `seconds[]` | Thống kê từng giây: số lượng, khoảng Δtick, cụm trống, độ lệch khe, bộ đếm theo tầng, chất lượng vô tuyến, bất thường |
+
+#### Ngữ nghĩa khe
+
+`khe = floor((device_ticks_us − đầu_giây) × khe_mỗi_giây / 1_000_000)`, tính bằng
+số nguyên trên tick thiết bị — đúng dạng của công thức độ chiếm chỗ phía trình
+duyệt `floor((t − đầu_giây) × khe + 1e-6)`. Một bản ghi thuộc khe nửa mở chứa
+`device_ticks_us` của nó; `slot_offset_us` là khoảng cách có dấu tới mốc bắt đầu
+khe lý thuyết (dương = trễ).
+
+#### Tầng nào gây lỗi?
+
+Mọi bộ đếm đều được ghi trên thiết bị RX, nhưng mỗi bộ đếm chỉ về một tầng khác
+nhau:
+
+| Dấu hiệu | Tầng | Kết luận | Hành động tiếp theo |
+|---|---|---|---|
+| Khe trống, `stream_sequence` có khoảng nhảy, Δ`raw_drop_total` > 0 | **RX (thiết bị)** — bản ghi không được gửi (hàng đợi đầy / không hợp lệ / gửi lô lỗi) | Thiết bị bỏ do hàng đợi đầy | Giảm PPS, tăng kích thước lô, kiểm tra CPU firmware |
+| Khe trống, có khoảng nhảy, Δ`raw_send_backpressure_total` > 0 | **Desktop** — client không nhận lô | Desktop đọc quá chậm | Tăng bộ đệm client, giảm nhịp làm mới 500 ms |
+| Khe trống, bộ đếm liên tục, RSSI lân cận thấp | **TX/airtime** (AP → thiết bị) | Mất trên không (airtime) | Đổi kênh, giảm lưu lượng khác, giảm PPS |
+| Khe trống, bộ đếm liên tục, RSSI bình thường | **Generator (desktop)** | Marker không được gửi / firmware không tạo CSI | Đối chiếu với log marker đã gửi |
+| Có mẫu, độ lệch khe lớn, độ lệch chuẩn khoảng cao | **Generator (desktop)** jitter | Jitter thời gian | Đo lại generator |
+
+`raw_drop_total` là mất phía **RX** (bản ghi chưa từng rời thiết bị);
+`raw_send_backpressure_total` là lỗi nhận phía **desktop**. Cùng triệu chứng
+(bản ghi thiếu trong tệp) nhưng ngược phía.
+
+"RSSI thấp" nghĩa là bằng hoặc dưới `LOW_RSSI_THRESHOLD_DBM` (−70 dBm) ở một
+trong hai bản ghi biên. Khoảng nhảy mà các bộ đếm không giải thích được sẽ được
+báo là `ambiguous` thay vì đoán.
+
+#### Hạn chế
+
+- Không có định danh marker: bản ghi không lưu marker UDP nào đã tạo ra nó, nên
+  không thể chứng minh "marker không được gửi" chỉ từ tệp.
+- Đường truyền là HTTP trên TCP nên không thể mất trên đường: khoảng nhảy
+  `stream_sequence` là mất phía thiết bị, không phải mất mạng.
+- `wifi_rx_ts_us` thuộc miền đồng hồ khác (và 32-bit), nên chỉ Δ tương đối có
+  nghĩa; `seq_num` bão hòa ở `u32::MAX`.
+- Giây cuối của bản ghi, và cả hai biên của cửa sổ trực tiếp, là giây một phần:
+  `seconds[].partial` được bật và tỉ lệ mất chỉ mô tả phần đã phủ.
+- Payload không nhỏ: bản ghi 34 giây với 100 khe mang khoảng 1 MB dữ liệu chẩn
+  đoán (bản ghi + khe trống + thống kê) bên cạnh ma trận biên độ.
+
+#### `--pps` cho tệp ngoại tuyến
+
+Không có `--pps`, tệp ngoại tuyến dùng tốc độ hiệu quả đo được, làm lưới co lại
+đúng ở những giây bị thiếu mẫu. Hãy truyền tốc độ đã cấu hình để giữ lưới đúng
+kích thước:
+
+```bash
+cargo run --bin visualize -- capture_v8.bin --pps 100
+```
+
 ## CLI độc lập
 
 ```bash
@@ -76,6 +156,7 @@ cargo run --bin visualize -- capture_v8.bin --serve --port 8080
 | `FILE` | Tệp ghi thô được viết bởi `collect` (mặc định: `capture_v8.bin`) |
 | `-o, --output FILE` | Đường dẫn đích cho bảng điều khiển HTML độc lập (mặc định: `<stem>_heatmap.html`) |
 | `--json FILE` | Đường dẫn xuất dữ liệu hiển thị JSON |
+| `--pps PPS` | Tốc độ gói danh định cho lưới khe chẩn đoán (mặc định: tốc độ hiệu quả đo được) |
 | `--serve` | Khởi động máy chủ web nhúng không đồng bộ |
 | `--port PORT` | Cổng cho máy chủ web (mặc định: `8080`) |
 | `--open` | Mở tệp HTML đã tạo hoặc URL máy chủ web trong trình duyệt hệ thống mặc định |
@@ -104,6 +185,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+```
+
+Truyền tốc độ gói đã cấu hình khi biết bản ghi bị thiếu mẫu, để lưới khe chẩn
+đoán giữ đúng kích thước mong muốn:
+
+```rust
+use rt_wireless_sensing::visualization::{
+    VisualizationData, VisualizationOptions, prepare_visualization_data_with_options,
+};
+
+// Tệp ngoại tuyến với PPS danh định tường minh.
+let data = VisualizationData::from_file_with_pps(Path::new("capture_v8.bin"), Some(100.0))?;
+
+// Hoặc từ các gói đã giải mã, kiểm soát đầy đủ dấu vết chẩn đoán.
+let packets = rt_wireless_sensing::visualization::decode_packets(&bytes)?;
+let data = prepare_visualization_data_with_options(
+    &packets,
+    Some("capture_v8.bin"),
+    packets[0].csi.device_ticks_us,
+    VisualizationOptions { nominal_pps: Some(100.0), capture_end: true },
+)?;
 ```
 
 ### Đính kèm kết quả phân loại

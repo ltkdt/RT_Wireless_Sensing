@@ -54,6 +54,87 @@ data refresh and disappears when the second leaves the 30 s window.
 This is a browser-side calculation over the displayed `timestamps`; no extra
 endpoint is involved.
 
+### 5. Diagnostic view (PPS-deficit analysis)
+
+A separate canvas behind a bottom toggle, independent of the amplitude heatmap
+(which is untouched while the toggle is off). It answers one question: *why does
+each second yield fewer CSI samples than the configured PPS?*
+
+Click a heatmap point to select its second, then enable **Diagnostic view**. The
+canvas draws the `subcarriers × slots` matrix of that second (`slots` = nominal
+PPS rounded once in Rust); empty columns are hatched. Hovering a cell shows a
+one-line identity (`Slot 12/99 · SC 31 — filled (frame #431)`); clicking a cell
+fills the **Timeslot details** box below the canvas, and the **Statistics** box
+shows the per-second numbers.
+
+Every value is computed in Rust from the `.bin` capture itself — the 60-byte
+HTTP frame prefix and the 64-byte CSI record header — and shipped in the
+`diagnostics` payload field, so the same numbers can be exported with `--json`
+for offline analysis.
+
+#### Payload
+
+| Field | Meaning |
+|---|---|
+| `slots_per_second` | Column count of the grid (nominal PPS rounded once) |
+| `origin_ticks` | `device_ticks_us` that maps to timestamp `0.0` |
+| `capture_end` | `true` for an offline file, `false` for a live window edge |
+| `records[]` | One row per received record: slot, slot offset, Δstream, Δdrop, Δbackpressure, Δticks, Δwifi_rx, RSSI/noise/SNR, flags, channel/PHY/width |
+| `empty_slots[]` | One row per slot without a record: cause, dropped frames, boundary records |
+| `seconds[]` | Per-second statistics: counts, Δtick intervals, bursts, slot offsets, layer counters, radio quality, anomalies |
+
+#### Slot semantics
+
+`slot = floor((device_ticks_us − second_start) × slots / 1_000_000)`, computed
+with integer arithmetic on device ticks — the exact form of the browser
+occupancy formula `floor((t − second_start) × slots + 1e-6)`. A record belongs
+to the half-open slot containing its `device_ticks_us`; `slot_offset_us` is the
+signed distance from the theoretical slot start (positive = late).
+
+#### Which layer is at fault?
+
+All counters are recorded on the RX device, but each one points at a different
+layer:
+
+| Signature | Layer | Conclusion | Next action |
+|---|---|---|---|
+| Empty slot, `stream_sequence` gap, Δ`raw_drop_total` > 0 | **RX (device)** — record not sent (queue full / invalid / batch fail) | Device drop due to full queue | Lower PPS, increase batch size, check firmware CPU |
+| Empty slot, gap, Δ`raw_send_backpressure_total` > 0 | **Desktop** — client did not accept the batch | Desktop reads too slowly | Increase client buffer, slow the 500 ms refresh |
+| Empty slot, contiguous counters, low neighbouring RSSI | **TX/airtime** (AP → device) | Over-air loss (airtime) | Change channel, reduce other traffic, lower PPS |
+| Empty slot, contiguous counters, normal RSSI | **Generator (desktop)** | Marker not sent / firmware produced no CSI | Corroborate with the sent-marker log |
+| Sample present, large slot offset, high interval std | **Generator (desktop)** jitter | Timing jitter | Measure the generator |
+
+`raw_drop_total` is an **RX-side** drop (the record never left the device);
+`raw_send_backpressure_total` is a **desktop-side** receive failure. Same symptom
+(record missing from the file), opposite sides.
+
+"Low RSSI" means at or below `LOW_RSSI_THRESHOLD_DBM` (−70 dBm) on either
+boundary record. A gap the counters do not explain is reported as `ambiguous`
+rather than guessed.
+
+#### Limitations
+
+- No marker identity: the capture does not record which UDP marker produced a
+  record, so "marker not sent" cannot be proven from the file alone.
+- The link is HTTP over TCP, so in-transit loss is impossible: a
+  `stream_sequence` gap is a device-side drop, not a network drop.
+- `wifi_rx_ts_us` is a different clock domain (and 32-bit), so only its relative
+  Δ is meaningful; `seq_num` saturates at `u32::MAX`.
+- The last second of a capture, and both edges of a live window, are partial:
+  `seconds[].partial` is set and the loss ratio describes only the covered part.
+- The payload is not free: a 34 s capture at 100 slots carries about 1 MB of
+  diagnostics (records + empty slots + statistics) next to the amplitude matrix.
+
+#### `--pps` for offline files
+
+Without `--pps`, an offline file falls back to the measured effective rate,
+which shrinks the grid exactly for the seconds that miss samples. Pass the
+configured rate to keep the grid at the intended size:
+
+```bash
+cargo run --bin visualize -- capture_v8.bin --pps 100
+```
+
 ## Standalone CLI
 
 ```bash
@@ -77,6 +158,7 @@ cargo run --bin visualize -- capture_v8.bin --serve --port 8080
 | `FILE` | Raw capture file written by `collect` (default: `capture_v8.bin`) |
 | `-o, --output FILE` | Destination path for standalone HTML dashboard (default: `<stem>_heatmap.html`) |
 | `--json FILE` | Path to export JSON visualization data |
+| `--pps PPS` | Nominal packet rate for the diagnostic slot grid (default: measured effective rate) |
 | `--serve` | Start embedded asynchronous web server |
 | `--port PORT` | Port for the web server (default: `8080`) |
 | `--open` | Open generated HTML file or web server URL in default system browser |
@@ -105,6 +187,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+```
+
+Pass the configured packet rate when the capture is known to miss samples, so
+the diagnostic slot grid keeps its intended size:
+
+```rust
+use rt_wireless_sensing::visualization::{
+    VisualizationData, VisualizationOptions, prepare_visualization_data_with_options,
+};
+
+// Offline file with an explicit nominal PPS.
+let data = VisualizationData::from_file_with_pps(Path::new("capture_v8.bin"), Some(100.0))?;
+
+// Or from decoded packets, with full control over the trace.
+let packets = rt_wireless_sensing::visualization::decode_packets(&bytes)?;
+let data = prepare_visualization_data_with_options(
+    &packets,
+    Some("capture_v8.bin"),
+    packets[0].csi.device_ticks_us,
+    VisualizationOptions { nominal_pps: Some(100.0), capture_end: true },
+)?;
 ```
 
 ### Attaching classification results

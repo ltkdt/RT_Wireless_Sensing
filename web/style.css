@@ -21,6 +21,12 @@
     padding: 0;
 }
 
+/* The `hidden` attribute must win over the display rules below (author styles
+   beat the UA [hidden] rule), so toggled sections really disappear. */
+[hidden] {
+    display: none !important;
+}
+
 body {
     background-color: var(--bg-primary);
     color: var(--text-primary);
@@ -290,6 +296,246 @@ button:active {
     z-index: 20;
     display: none;
     white-space: nowrap;
+}
+
+/* Diagnostic View (Phase 1: placeholder values) */
+.diagnostic-toggle-bar {
+    display: flex;
+    justify-content: flex-end;
+    padding: 4px 2px;
+}
+
+.diagnostic-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+}
+
+.diagnostic-toggle input {
+    accent-color: var(--accent-amber);
+    cursor: pointer;
+}
+
+.diagnostic-toggle:hover {
+    color: var(--text-primary);
+}
+
+.diagnostic-card {
+    background-color: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.diagnostic-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.diagnostic-header h2 {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.diagnostic-hint {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+}
+
+.slot-canvas-wrapper {
+    position: relative;
+    width: 100%;
+    background-color: #0b1120;
+    border-radius: 8px;
+    border: 1px solid #1e293b;
+    overflow: hidden;
+}
+
+#slotCanvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    cursor: crosshair;
+}
+
+.slot-tooltip {
+    position: absolute;
+    pointer-events: none;
+    background: rgba(15, 23, 42, 0.96);
+    border: 1px solid var(--accent-amber);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    line-height: 1.5;
+    color: var(--text-primary);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+    z-index: 20;
+    display: none;
+    white-space: nowrap;
+}
+
+.slot-tooltip .tip-title {
+    font-weight: 700;
+    color: var(--accent-amber);
+}
+
+.tip-ph {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+/* Legend lives outside the canvas, above it. */
+.slot-legend {
+    display: flex;
+    justify-content: flex-end;
+    gap: 16px;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+}
+
+.legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.legend-swatch {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 2px;
+    border: 1px solid rgba(148, 163, 184, 0.35);
+}
+
+.legend-filled {
+    background: #fde725;
+}
+
+.legend-empty {
+    background-color: rgb(51, 65, 85);
+    background-image: repeating-linear-gradient(
+        45deg,
+        rgba(148, 163, 184, 0.55) 0 1px,
+        transparent 1px 4px
+    );
+}
+
+.tip-layer {
+    display: inline-block;
+    padding: 0 5px;
+    border-radius: 4px;
+    font-size: 0.65rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border: 1px solid;
+}
+
+.tip-layer.rx { color: #f87171; border-color: rgba(248, 113, 113, 0.5); background: rgba(248, 113, 113, 0.12); }
+.tip-layer.desktop { color: var(--accent-amber); border-color: rgba(251, 191, 36, 0.5); background: rgba(251, 191, 36, 0.12); }
+.tip-layer.tx { color: var(--accent-purple); border-color: rgba(192, 132, 252, 0.5); background: rgba(192, 132, 252, 0.12); }
+.tip-layer.stream { color: var(--accent-blue); border-color: rgba(56, 189, 248, 0.5); background: rgba(56, 189, 248, 0.12); }
+
+.diag-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 10px;
+    background-color: rgba(15, 23, 42, 0.6);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 12px 14px;
+}
+
+.stats-group-title {
+    grid-column: 1 / -1;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--accent-amber);
+    font-weight: 700;
+    border-bottom: 1px solid var(--border-color);
+    padding-bottom: 4px;
+}
+
+/* Timeslot details: same card style as the statistics box, one row per field. */
+.diag-details {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    background-color: rgba(15, 23, 42, 0.6);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 12px 14px;
+}
+
+.diag-detail-row {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+}
+
+.diag-detail-row .detail-field {
+    flex: 0 0 210px;
+    color: var(--accent-blue);
+    font-weight: 600;
+}
+
+.diag-detail-row .detail-meaning {
+    flex: 1;
+    color: var(--text-secondary);
+}
+
+.diag-detail-row .detail-value {
+    flex: 0 0 auto;
+    color: var(--text-primary);
+    font-weight: 600;
+    text-align: right;
+}
+
+.diag-stat {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+}
+
+.diag-stat .stat-label {
+    color: var(--text-secondary);
+}
+
+.diag-stat .stat-value {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+.diag-stat .stat-value.placeholder {
+    color: var(--text-muted);
+    font-style: italic;
+    font-weight: 400;
+}
+
+.diag-note {
+    grid-column: 1 / -1;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    font-style: italic;
 }
 
 /* Footer */

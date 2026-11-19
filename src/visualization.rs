@@ -26,6 +26,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::csi_header::{RAW_CSI_FLAG_FIRST_WORD_INVALID, RAW_CSI_FLAG_FRESH};
 use crate::decoder::{CsiPacket, DecodeError, FrameStreamDecoder};
 
 /// Embedded dashboard HTML template.
@@ -36,9 +37,6 @@ pub const CSS_STYLES: &str = include_str!("../web/style.css");
 
 /// Embedded dashboard JavaScript visualizer.
 pub const JS_VISUALIZER: &str = include_str!("../web/visualizer.js");
-
-/// Standard subcarriers per record for HT20.
-pub const STANDARD_SUBCARRIERS: usize = 64;
 
 /// Measurement metadata for dashboard display.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -81,6 +79,259 @@ pub struct ClassificationResult {
     pub details: Option<String>,
 }
 
+/// Diagnostic trace for the dashboard's diagnostic view (PPS-deficit analysis).
+///
+/// Every value comes from the `.bin` capture itself — the 60-byte HTTP frame
+/// prefix and the 64-byte CSI record header — with no decoder change. See
+/// `PLAN.md` ("Diagnostic View") for the design and the classification rules.
+///
+/// The trace is attached to [`VisualizationData`] as an `Option`, so payloads
+/// produced before the diagnostic view existed deserialize with `None` and the
+/// web UI keeps the toggle hidden.
+/// RSSI at or below this value (dBm) counts as "low" when an empty slot is
+/// classified as over-air loss.
+///
+/// The threshold is absolute because a capture carries no per-session
+/// reference: a link that normally sits at −35 dBm and falls to −75 dBm around
+/// an empty slot is the signature of a marker lost over the air.
+pub const LOW_RSSI_THRESHOLD_DBM: i8 = -70;
+
+/// Layer a diagnostic finding points at.
+///
+/// Every counter is recorded on the RX device, but each one attributes the
+/// cause to a different layer; see `PLAN.md` §3.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticLayer {
+    /// The RX device (ESP32) never sent the record.
+    RxDevice,
+    /// The desktop client did not accept the batch.
+    Desktop,
+    /// The marker frame was lost over the air (AP → device).
+    TxAirtime,
+    /// The generator did not send the marker, or firmware produced no CSI.
+    Generator,
+    /// Not enough information to attribute the loss.
+    Unknown,
+}
+
+/// Why a slot holds no record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticCause {
+    /// `stream_sequence` gap with `raw_drop_total` rising: the device dropped
+    /// the record before sending it (queue full, invalid packet, batch send
+    /// failed). This is an **RX-side** drop, not a desktop receive problem.
+    DeviceDrop,
+    /// `stream_sequence` gap with `raw_send_backpressure_total` rising: the
+    /// desktop did not accept the batch, so it reads too slowly.
+    DesktopBackpressure,
+    /// Contiguous counters and low neighbouring RSSI: the marker was lost over
+    /// the air between the AP and the device.
+    AirLoss,
+    /// Contiguous counters and normal RSSI: no record was generated (marker not
+    /// sent, or firmware produced no CSI).
+    GeneratorMissed,
+    /// No boundary record closes the gap (window or capture edge), so the loss
+    /// cannot be attributed.
+    Ambiguous,
+}
+
+impl DiagnosticCause {
+    /// Layer this cause points at.
+    pub fn layer(self) -> DiagnosticLayer {
+        match self {
+            Self::DeviceDrop => DiagnosticLayer::RxDevice,
+            Self::DesktopBackpressure => DiagnosticLayer::Desktop,
+            Self::AirLoss => DiagnosticLayer::TxAirtime,
+            Self::GeneratorMissed => DiagnosticLayer::Generator,
+            Self::Ambiguous => DiagnosticLayer::Unknown,
+        }
+    }
+}
+
+/// One received record with every derived metric precomputed.
+///
+/// The web layer only formats these numbers; it keeps no counter state, so the
+/// deltas are always between consecutively received frames (the counters are
+/// session-cumulative).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosticRecord {
+    /// Index into [`VisualizationData::timestamps`] and `amplitudes`.
+    pub frame: usize,
+    /// Whole seconds since the trace origin.
+    pub second: u32,
+    /// Slot index inside `second`.
+    pub slot: u32,
+    /// `device_ticks_us − slot_start`, in µs; negative means early.
+    pub slot_offset_us: i64,
+    /// `stream_sequence`: one-based packets offered to the stream, including
+    /// the ones the device dropped.
+    pub stream_sequence: u64,
+    /// Saturated copy of `stream_sequence` from the CSI record header.
+    pub seq_num: u32,
+    /// Device monotonic clock of the sample, in µs.
+    pub device_ticks_us: u64,
+    /// Δ`stream_sequence` against the previous record; `None` for the first.
+    pub delta_stream: Option<u64>,
+    /// Δ`raw_drop_total` against the previous record.
+    pub delta_drop: Option<u64>,
+    /// Δ`raw_send_backpressure_total` against the previous record.
+    pub delta_backpressure: Option<u64>,
+    /// Δ`device_ticks_us` against the previous record.
+    pub delta_ticks_us: Option<u64>,
+    /// Δ`wifi_rx_ts_us` against the previous record, when both are valid.
+    ///
+    /// The driver clock is 32-bit, so the difference is taken modulo `2^32`:
+    /// a wrap shows as a small interval instead of a huge negative one.
+    pub delta_wifi_rx_us: Option<i64>,
+    /// RSSI in dBm.
+    pub rssi_dbm: i8,
+    /// Noise floor in dBm; `None` when the device sent the `-128` sentinel.
+    pub noise_floor_dbm: Option<i8>,
+    /// `rssi_dbm − noise_floor_dbm`, when the noise floor is known.
+    pub snr_db: Option<i16>,
+    /// Raw `flags` byte of the CSI record header.
+    pub flags: u8,
+    /// Wi-Fi channel.
+    pub channel: u8,
+    /// PHY mode code (see [`crate::csi_header::phy_mode_name`]).
+    pub phy_mode_code: u8,
+    /// Channel width code (see [`crate::csi_header::channel_width_name`]).
+    pub channel_width_code: u8,
+}
+
+/// One record at the edge of an empty slot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosticBoundary {
+    /// Index into [`VisualizationData::timestamps`].
+    pub frame: usize,
+    /// Saturated `stream_sequence` copy.
+    pub seq_num: u32,
+    /// Device monotonic clock, in µs.
+    pub device_ticks_us: u64,
+    /// RSSI in dBm.
+    pub rssi_dbm: i8,
+}
+
+/// One slot without a record, with the cause inferred from its boundaries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosticEmptySlot {
+    /// Whole seconds since the trace origin.
+    pub second: u32,
+    /// Slot index inside `second`.
+    pub slot: u32,
+    /// Inferred cause.
+    pub cause: DiagnosticCause,
+    /// Frames the stream skipped across the gap (`Δstream − 1`); `0` when the
+    /// gap is unknown.
+    pub dropped_frames: u64,
+    /// Δ`raw_drop_total` across the gap.
+    pub delta_drop: u64,
+    /// Δ`raw_send_backpressure_total` across the gap.
+    pub delta_backpressure: u64,
+    /// Last record before the slot, when the trace contains one.
+    pub previous: Option<DiagnosticBoundary>,
+    /// First record after the slot, when the trace contains one.
+    pub next: Option<DiagnosticBoundary>,
+}
+
+/// Per-second statistics for the diagnostic view.
+///
+/// Computed in Rust so the numbers can be exported for offline analysis; the
+/// web layer only formats them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosticSecondStats {
+    /// Whole seconds since the trace origin.
+    pub second: u32,
+    /// Slot count of a full second.
+    pub slots: usize,
+    /// Records in this second.
+    pub samples: usize,
+    /// Slots holding at least one record.
+    pub filled_slots: usize,
+    /// Slots holding no record.
+    pub empty_slots: usize,
+    /// Records in this second (one second of device time).
+    pub effective_pps: f64,
+    /// `empty_slots / slots`.
+    pub loss_ratio: f64,
+    /// `1e6 / slots`, the theoretical interval between two records.
+    pub nominal_interval_us: f64,
+    /// Mean Δ`device_ticks_us` between consecutive records.
+    pub interval_mean_us: f64,
+    /// Median Δ`device_ticks_us`.
+    pub interval_median_us: f64,
+    /// Smallest Δ`device_ticks_us`.
+    pub interval_min_us: u64,
+    /// Largest Δ`device_ticks_us`.
+    pub interval_max_us: u64,
+    /// Population standard deviation of Δ`device_ticks_us` (jitter).
+    pub interval_std_us: f64,
+    /// 95th percentile of Δ`device_ticks_us` (nearest rank).
+    pub interval_p95_us: f64,
+    /// Number of empty-slot runs of length 1, 2, and 3 or more.
+    pub burst_histogram: [usize; 3],
+    /// Longest run of consecutive empty slots.
+    pub longest_empty_run: usize,
+    /// Mean slot offset (lateness) in µs.
+    pub offset_mean_us: f64,
+    /// Smallest slot offset in µs.
+    pub offset_min_us: i64,
+    /// Largest slot offset in µs.
+    pub offset_max_us: i64,
+    /// Σ(`Δstream − 1`): frames dropped at the device stream layer.
+    pub stream_gap_total: u64,
+    /// Σ`Δraw_drop_total`.
+    pub drop_total: u64,
+    /// Σ`Δraw_send_backpressure_total`.
+    pub backpressure_total: u64,
+    /// Records whose `Δraw_send_backpressure_total` is positive.
+    pub backpressure_frames: usize,
+    /// Lowest RSSI in the second.
+    pub rssi_min_dbm: Option<i8>,
+    /// Mean RSSI in the second.
+    pub rssi_mean_dbm: Option<f64>,
+    /// Highest RSSI in the second.
+    pub rssi_max_dbm: Option<i8>,
+    /// Empty slots classified as over-air loss.
+    pub empty_slots_low_rssi: usize,
+    /// Records without the `FRESH` flag.
+    pub missing_fresh: usize,
+    /// Records with the first-word-invalid flag.
+    pub first_word_invalid: usize,
+    /// Channel / PHY / width changes between consecutive records.
+    pub config_changes: usize,
+    /// `true` when the trace does not cover the whole second (first or last
+    /// second of a capture or of a live window), so the loss ratio describes
+    /// only the covered part.
+    pub partial: bool,
+}
+
+/// Diagnostic trace for the dashboard's diagnostic view (PPS-deficit analysis).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosticTrace {
+    /// Integer slot count per second — the nominal PPS rounded once in Rust —
+    /// used as the column count of the diagnostic slot grid. The web UI uses
+    /// this explicit count instead of re-deriving it, so the grid matches the
+    /// occupancy slot logic exactly.
+    pub slots_per_second: usize,
+    /// `device_ticks_us` that maps to timestamp `0.0`.
+    pub origin_ticks: u64,
+    /// `true` when the last record is the end of the capture, `false` when the
+    /// trace ends at a live sliding-window edge.
+    ///
+    /// Streaming drops records outside its window before publishing, so without
+    /// this flag every window edge would look like an unattributable gap.
+    pub capture_end: bool,
+    /// One row per received record, in capture order.
+    pub records: Vec<DiagnosticRecord>,
+    /// One row per slot without a record, in `(second, slot)` order.
+    pub empty_slots: Vec<DiagnosticEmptySlot>,
+    /// Per-second statistics, one row per second covered by the trace.
+    pub seconds: Vec<DiagnosticSecondStats>,
+}
+
 /// Complete dataset prepared for the web visualization layer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VisualizationData {
@@ -92,6 +343,12 @@ pub struct VisualizationData {
     pub amplitudes: Vec<Vec<f32>>,
     /// Optional classification result (dedicated display area in dashboard).
     pub classification: Option<ClassificationResult>,
+    /// Optional diagnostic trace for the diagnostic view.
+    ///
+    /// Like [`VisualizationData::classification`], this is an `Option`, so
+    /// payloads produced before the diagnostic view existed deserialize with
+    /// `None` and the web UI keeps the diagnostic toggle hidden.
+    pub diagnostics: Option<DiagnosticTrace>,
 }
 
 /// One state snapshot exposed by the live dashboard server.
@@ -252,6 +509,440 @@ pub fn decode_packets(bytes: &[u8]) -> Result<Vec<CsiPacket>, VisualizationError
     Ok(packets)
 }
 
+/// Build the diagnostic trace for `packets`.
+///
+/// `origin_ticks` is the `device_ticks_us` that maps to timestamp `0.0`, so the
+/// slot grid shares the time base of [`VisualizationData::timestamps`].
+/// `slots_per_second` is the nominal PPS rounded once by the caller.
+///
+/// Slot assignment uses integer arithmetic on device ticks
+/// (`slot = within_second_us * slots / 1_000_000`), which is the exact form of
+/// the web occupancy formula `floor((t − second_start) * slots + 1e-6)`.
+fn build_diagnostic_trace(
+    packets: &[CsiPacket],
+    origin_ticks: u64,
+    slots_per_second: usize,
+    capture_end: bool,
+) -> DiagnosticTrace {
+    let slots = slots_per_second.max(1);
+    let mut records = Vec::with_capacity(packets.len());
+    let mut previous: Option<&CsiPacket> = None;
+
+    for (frame, packet) in packets.iter().enumerate() {
+        let ticks = packet.csi.device_ticks_us;
+        let relative = ticks.saturating_sub(origin_ticks);
+        let second = (relative / 1_000_000) as u32;
+        let within = relative % 1_000_000;
+        let slot = (within * slots as u64 / 1_000_000) as u32;
+        let slot_start = u64::from(slot) * 1_000_000 / slots as u64;
+        let slot_offset_us = within as i64 - slot_start as i64;
+
+        let delta_stream = previous
+            .map(|previous| packet.frame.stream_sequence.saturating_sub(previous.frame.stream_sequence));
+        let delta_drop = previous
+            .map(|previous| packet.frame.raw_drop_total.saturating_sub(previous.frame.raw_drop_total));
+        let delta_backpressure = previous.map(|previous| {
+            packet
+                .frame
+                .raw_send_backpressure_total
+                .saturating_sub(previous.frame.raw_send_backpressure_total)
+        });
+        let delta_ticks_us = previous.map(|previous| ticks.saturating_sub(previous.csi.device_ticks_us));
+        let delta_wifi_rx_us = previous.and_then(|previous| {
+            match (
+                packet.csi.valid_wifi_rx_ts_us(),
+                previous.csi.valid_wifi_rx_ts_us(),
+            ) {
+                (Some(current), Some(previous)) => {
+                    Some(i64::from(current.wrapping_sub(previous) as i32))
+                }
+                _ => None,
+            }
+        });
+
+        let noise_floor_dbm = packet.csi.valid_noise_floor_dbm();
+        records.push(DiagnosticRecord {
+            frame,
+            second,
+            slot,
+            slot_offset_us,
+            stream_sequence: packet.frame.stream_sequence,
+            seq_num: packet.csi.seq_num,
+            device_ticks_us: ticks,
+            delta_stream,
+            delta_drop,
+            delta_backpressure,
+            delta_ticks_us,
+            delta_wifi_rx_us,
+            rssi_dbm: packet.csi.rssi_dbm,
+            noise_floor_dbm,
+            snr_db: noise_floor_dbm.map(|floor| i16::from(packet.csi.rssi_dbm) - i16::from(floor)),
+            flags: packet.csi.flags,
+            channel: packet.csi.channel,
+            phy_mode_code: packet.csi.phy_mode_code,
+            channel_width_code: packet.csi.channel_width_code,
+        });
+        previous = Some(packet);
+    }
+
+    let empty_slots = collect_empty_slots(&records, slots);
+    let seconds = collect_second_stats(&records, &empty_slots, slots);
+
+    DiagnosticTrace {
+        slots_per_second: slots,
+        origin_ticks,
+        capture_end,
+        records,
+        empty_slots,
+        seconds,
+    }
+}
+
+/// Enumerate every slot without a record between the first and last record.
+fn collect_empty_slots(records: &[DiagnosticRecord], slots: usize) -> Vec<DiagnosticEmptySlot> {
+    let (Some(first), Some(last)) = (records.first(), records.last()) else {
+        return Vec::new();
+    };
+
+    let mut empty_slots = Vec::new();
+    for second in first.second..=last.second {
+        for slot in 0..slots as u32 {
+            // Records are sorted by (second, slot), so the first record at or
+            // after this slot is the closing boundary and the one before it is
+            // the opening boundary.
+            let next_index =
+                records.partition_point(|record| (record.second, record.slot) < (second, slot));
+            if records
+                .get(next_index)
+                .is_some_and(|record| record.second == second && record.slot == slot)
+            {
+                continue;
+            }
+
+            let previous = next_index.checked_sub(1).map(|index| &records[index]);
+            let next = records.get(next_index);
+            let (cause, dropped_frames, delta_drop, delta_backpressure) =
+                classify_empty_slot(previous, next);
+
+            empty_slots.push(DiagnosticEmptySlot {
+                second,
+                slot,
+                cause,
+                dropped_frames,
+                delta_drop,
+                delta_backpressure,
+                previous: previous.map(boundary),
+                next: next.map(boundary),
+            });
+        }
+    }
+    empty_slots
+}
+
+/// Classify one empty slot from the records on both sides of it.
+///
+/// The decoder enforces `Δfresh_record_total == 1` between consecutively
+/// received frames, so a stream gap is exactly `Δstream_sequence > 1`.
+fn classify_empty_slot(
+    previous: Option<&DiagnosticRecord>,
+    next: Option<&DiagnosticRecord>,
+) -> (DiagnosticCause, u64, u64, u64) {
+    let (Some(previous), Some(next)) = (previous, next) else {
+        return (DiagnosticCause::Ambiguous, 0, 0, 0);
+    };
+
+    let delta_stream = next.stream_sequence.saturating_sub(previous.stream_sequence);
+    let delta_drop = next.delta_drop.unwrap_or(0);
+    let delta_backpressure = next.delta_backpressure.unwrap_or(0);
+
+    if delta_stream > 1 {
+        let dropped_frames = delta_stream - 1;
+        let cause = if delta_drop > 0 {
+            DiagnosticCause::DeviceDrop
+        } else if delta_backpressure > 0 {
+            DiagnosticCause::DesktopBackpressure
+        } else {
+            // A gap the counters do not explain: do not guess a layer.
+            DiagnosticCause::Ambiguous
+        };
+        (cause, dropped_frames, delta_drop, delta_backpressure)
+    } else {
+        let low_rssi = previous.rssi_dbm.min(next.rssi_dbm) <= LOW_RSSI_THRESHOLD_DBM;
+        let cause = if low_rssi {
+            DiagnosticCause::AirLoss
+        } else {
+            DiagnosticCause::GeneratorMissed
+        };
+        (cause, 0, delta_drop, delta_backpressure)
+    }
+}
+
+/// Boundary summary of one record.
+fn boundary(record: &DiagnosticRecord) -> DiagnosticBoundary {
+    DiagnosticBoundary {
+        frame: record.frame,
+        seq_num: record.seq_num,
+        device_ticks_us: record.device_ticks_us,
+        rssi_dbm: record.rssi_dbm,
+    }
+}
+
+/// Compute one [`DiagnosticSecondStats`] row per second covered by the trace.
+fn collect_second_stats(
+    records: &[DiagnosticRecord],
+    empty_slots: &[DiagnosticEmptySlot],
+    slots: usize,
+) -> Vec<DiagnosticSecondStats> {
+    let (Some(first), Some(last)) = (records.first(), records.last()) else {
+        return Vec::new();
+    };
+
+    let mut stats = Vec::new();
+    let mut record_start = 0;
+    let mut empty_start = 0;
+
+    for second in first.second..=last.second {
+        let mut record_end = record_start;
+        while record_end < records.len() && records[record_end].second == second {
+            record_end += 1;
+        }
+        let mut empty_end = empty_start;
+        while empty_end < empty_slots.len() && empty_slots[empty_end].second == second {
+            empty_end += 1;
+        }
+
+        let second_records = &records[record_start..record_end];
+        let partial = (second == first.second
+            && second_records.first().is_some_and(|record| record.slot > 0))
+            || (second == last.second
+                && second_records
+                    .last()
+                    .is_some_and(|record| record.slot + 1 < slots as u32));
+
+        stats.push(second_stats(
+            second,
+            second_records,
+            &empty_slots[empty_start..empty_end],
+            slots,
+            partial,
+        ));
+
+        record_start = record_end;
+        empty_start = empty_end;
+    }
+    stats
+}
+
+/// Statistics of one second.
+fn second_stats(
+    second: u32,
+    records: &[DiagnosticRecord],
+    empty_slots: &[DiagnosticEmptySlot],
+    slots: usize,
+    partial: bool,
+) -> DiagnosticSecondStats {
+    let samples = records.len();
+
+    // Records are sorted by slot, so distinct slots are slot transitions.
+    let mut filled_slots = 0;
+    let mut previous_slot = None;
+    for record in records {
+        if previous_slot != Some(record.slot) {
+            filled_slots += 1;
+            previous_slot = Some(record.slot);
+        }
+    }
+
+    let intervals: Vec<f64> = records
+        .iter()
+        .filter_map(|record| record.delta_ticks_us)
+        .map(|delta| delta as f64)
+        .collect();
+    let mut sorted_intervals = intervals.clone();
+    sorted_intervals.sort_by(|left, right| {
+        left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let interval_mean_us = mean(&intervals);
+
+    let offsets: Vec<f64> = records
+        .iter()
+        .map(|record| record.slot_offset_us as f64)
+        .collect();
+
+    let mut burst_histogram = [0usize; 3];
+    let mut longest_empty_run = 0;
+    let mut run = 0;
+    let mut previous_empty_slot: Option<u32> = None;
+    for empty in empty_slots {
+        if previous_empty_slot.is_some_and(|slot| empty.slot == slot + 1) {
+            run += 1;
+        } else {
+            if run > 0 {
+                burst_histogram[(run - 1).min(2)] += 1;
+                longest_empty_run = longest_empty_run.max(run);
+            }
+            run = 1;
+        }
+        previous_empty_slot = Some(empty.slot);
+    }
+    if run > 0 {
+        burst_histogram[(run - 1).min(2)] += 1;
+        longest_empty_run = longest_empty_run.max(run);
+    }
+
+    let empty_count = slots.saturating_sub(filled_slots);
+
+    DiagnosticSecondStats {
+        second,
+        slots,
+        samples,
+        filled_slots,
+        empty_slots: empty_count,
+        effective_pps: samples as f64,
+        loss_ratio: empty_count as f64 / slots as f64,
+        nominal_interval_us: 1_000_000.0 / slots as f64,
+        interval_mean_us,
+        interval_median_us: median(&sorted_intervals),
+        interval_min_us: sorted_intervals.first().copied().unwrap_or(0.0) as u64,
+        interval_max_us: sorted_intervals.last().copied().unwrap_or(0.0) as u64,
+        interval_std_us: std_dev(&intervals, interval_mean_us),
+        interval_p95_us: percentile(&sorted_intervals, 0.95),
+        burst_histogram,
+        longest_empty_run,
+        offset_mean_us: mean(&offsets),
+        offset_min_us: records
+            .iter()
+            .map(|record| record.slot_offset_us)
+            .min()
+            .unwrap_or(0),
+        offset_max_us: records
+            .iter()
+            .map(|record| record.slot_offset_us)
+            .max()
+            .unwrap_or(0),
+        stream_gap_total: records
+            .iter()
+            .filter_map(|record| record.delta_stream)
+            .map(|delta| delta.saturating_sub(1))
+            .sum(),
+        drop_total: records.iter().filter_map(|record| record.delta_drop).sum(),
+        backpressure_total: records
+            .iter()
+            .filter_map(|record| record.delta_backpressure)
+            .sum(),
+        backpressure_frames: records
+            .iter()
+            .filter(|record| record.delta_backpressure.is_some_and(|delta| delta > 0))
+            .count(),
+        rssi_min_dbm: records.iter().map(|record| record.rssi_dbm).min(),
+        rssi_mean_dbm: (samples > 0).then(|| {
+            records
+                .iter()
+                .map(|record| f64::from(record.rssi_dbm))
+                .sum::<f64>()
+                / samples as f64
+        }),
+        rssi_max_dbm: records.iter().map(|record| record.rssi_dbm).max(),
+        empty_slots_low_rssi: empty_slots
+            .iter()
+            .filter(|empty| empty.cause == DiagnosticCause::AirLoss)
+            .count(),
+        missing_fresh: records
+            .iter()
+            .filter(|record| record.flags & RAW_CSI_FLAG_FRESH == 0)
+            .count(),
+        first_word_invalid: records
+            .iter()
+            .filter(|record| record.flags & RAW_CSI_FLAG_FIRST_WORD_INVALID != 0)
+            .count(),
+        config_changes: records
+            .windows(2)
+            .filter(|pair| {
+                pair[0].channel != pair[1].channel
+                    || pair[0].phy_mode_code != pair[1].phy_mode_code
+                    || pair[0].channel_width_code != pair[1].channel_width_code
+            })
+            .count(),
+        partial,
+    }
+}
+
+/// Arithmetic mean; `0.0` for an empty slice.
+fn mean(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
+/// Median of an already sorted slice; `0.0` when empty.
+fn median(sorted: &[f64]) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let middle = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        (sorted[middle - 1] + sorted[middle]) / 2.0
+    } else {
+        sorted[middle]
+    }
+}
+
+/// Nearest-rank percentile of an already sorted slice; `0.0` when empty.
+fn percentile(sorted: &[f64], fraction: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = (fraction * sorted.len() as f64).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
+}
+
+/// Population standard deviation; `0.0` for an empty slice.
+fn std_dev(values: &[f64], mean: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let variance = values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / values.len() as f64;
+    variance.sqrt()
+}
+
+/// Options that control how [`VisualizationData`] is prepared.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VisualizationOptions {
+    /// Nominal PPS used to divide a second into occupancy slots.
+    ///
+    /// `None` (or a non-positive value) falls back to the measured effective
+    /// rate, which is wrong exactly for the seconds that miss samples — pass
+    /// the configured `--pps` when preparing an offline file.
+    pub nominal_pps: Option<f64>,
+    /// `true` when `packets` ends at the end of the capture.
+    ///
+    /// A live dashboard publishes a sliding window, so its last record is not
+    /// the end of the capture; the diagnostic trace uses this flag to tell a
+    /// window edge from a capture edge.
+    pub capture_end: bool,
+}
+
+impl Default for VisualizationOptions {
+    fn default() -> Self {
+        Self {
+            nominal_pps: None,
+            capture_end: true,
+        }
+    }
+}
+
+/// `device_ticks_us` of the first packet, or `0` when there is none.
+fn first_device_ticks(packets: &[CsiPacket]) -> u64 {
+    packets
+        .first()
+        .map_or(0, |packet| packet.csi.device_ticks_us)
+}
+
 /// Prepare [`VisualizationData`] from a slice of decoded [`CsiPacket`].
 ///
 /// Timestamps start at `0.0` at the first packet's `device_ticks_us`.
@@ -259,10 +950,12 @@ pub fn prepare_visualization_data(
     packets: &[CsiPacket],
     source_name: Option<&str>,
 ) -> Result<VisualizationData, VisualizationError> {
-    let origin_ticks = packets
-        .first()
-        .map_or(0, |packet| packet.csi.device_ticks_us);
-    prepare_visualization_data_with_origin(packets, source_name, origin_ticks, None)
+    prepare_visualization_data_with_options(
+        packets,
+        source_name,
+        first_device_ticks(packets),
+        VisualizationOptions::default(),
+    )
 }
 
 /// Prepare [`VisualizationData`] relative to an explicit time origin.
@@ -280,6 +973,24 @@ pub fn prepare_visualization_data_with_origin(
     source_name: Option<&str>,
     origin_ticks: u64,
     nominal_pps: Option<f64>,
+) -> Result<VisualizationData, VisualizationError> {
+    prepare_visualization_data_with_options(
+        packets,
+        source_name,
+        origin_ticks,
+        VisualizationOptions {
+            nominal_pps,
+            capture_end: true,
+        },
+    )
+}
+
+/// Prepare [`VisualizationData`] with explicit [`VisualizationOptions`].
+pub fn prepare_visualization_data_with_options(
+    packets: &[CsiPacket],
+    source_name: Option<&str>,
+    origin_ticks: u64,
+    options: VisualizationOptions,
 ) -> Result<VisualizationData, VisualizationError> {
     let first = packets.first().ok_or(VisualizationError::NoRecords)?;
     let subcarriers = first.csi.num_sc as usize;
@@ -337,7 +1048,8 @@ pub fn prepare_visualization_data_with_origin(
     } else {
         0.0
     };
-    let nominal_pps = nominal_pps
+    let nominal_pps = options
+        .nominal_pps
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(effective_pps);
 
@@ -358,27 +1070,67 @@ pub fn prepare_visualization_data_with_origin(
         device_id,
     };
 
+    // The diagnostic toggle is gated on the presence of this field, and the
+    // slot-grid column count is passed explicitly (nominal PPS rounded once
+    // here) so the web UI does not re-derive it.
+    let slots_per_second = nominal_pps.round().max(1.0) as usize;
+    let diagnostics = Some(build_diagnostic_trace(
+        packets,
+        origin_ticks,
+        slots_per_second,
+        options.capture_end,
+    ));
+
     Ok(VisualizationData {
         metadata,
         timestamps,
         amplitudes,
         classification: None,
+        diagnostics,
     })
 }
 
 impl VisualizationData {
     /// Load and decode a binary capture file.
     pub fn from_file(path: &Path) -> Result<Self, VisualizationError> {
+        Self::from_file_with_pps(path, None)
+    }
+
+    /// Load and decode a binary capture file with an explicit nominal PPS.
+    ///
+    /// Without `nominal_pps` the slot grid falls back to the measured effective
+    /// rate, which shrinks the grid exactly for the seconds that miss samples.
+    /// Pass the configured `--pps` to keep the grid at the intended rate.
+    pub fn from_file_with_pps(
+        path: &Path,
+        nominal_pps: Option<f64>,
+    ) -> Result<Self, VisualizationError> {
         let bytes = std::fs::read(path)?;
-        let packets = decode_packets(&bytes)?;
-        let source_name = path.file_name().and_then(|n| n.to_str());
-        prepare_visualization_data(&packets, source_name)
+        let source_name = path.file_name().and_then(|name| name.to_str());
+        Self::from_bytes_with_pps(&bytes, source_name, nominal_pps)
     }
 
     /// Load and decode from raw bytes in memory.
     pub fn from_bytes(bytes: &[u8], source_name: Option<&str>) -> Result<Self, VisualizationError> {
+        Self::from_bytes_with_pps(bytes, source_name, None)
+    }
+
+    /// Load and decode from raw bytes in memory with an explicit nominal PPS.
+    pub fn from_bytes_with_pps(
+        bytes: &[u8],
+        source_name: Option<&str>,
+        nominal_pps: Option<f64>,
+    ) -> Result<Self, VisualizationError> {
         let packets = decode_packets(bytes)?;
-        prepare_visualization_data(&packets, source_name)
+        prepare_visualization_data_with_options(
+            &packets,
+            source_name,
+            first_device_ticks(&packets),
+            VisualizationOptions {
+                nominal_pps,
+                capture_end: true,
+            },
+        )
     }
 
     /// Attach an activity or gesture classification result to this visualization dataset.

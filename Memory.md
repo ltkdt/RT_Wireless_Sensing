@@ -10,8 +10,8 @@ them here. This file is not a changelog.
 > DSP-rewrite plan is obsolete — DSP is implemented in `src/dsp/` and documented in
 > `docs_EN/dsp.md` / `docs_VN/dsp.md`.
 
-Last updated: 2026-11-19 (PLAN.md now points to the approved Diagnostic-view plan;
-removed the stale "PLAN.md is deprecated" note)
+Last updated: 2026-11-19 (diagnostic view phase 2 implemented: real per-record
+data, empty-slot classification, and per-second statistics computed in Rust)
 
 ---
 
@@ -132,6 +132,22 @@ record, from `device_ticks_us`) plus `amplitude_00..63` and `phase_00..63` —
   window **30 s** with absolute time labels. Clicking the heatmap reports occupancy
   of that second as `N_filled / N` slots, where `N` = configured PPS
   (`metadata.nominal_pps` drives the slot count).
+- **Diagnostic view (phase 2, implemented).** `VisualizationData.diagnostics`
+  carries `DiagnosticTrace { slots_per_second, origin_ticks, capture_end,
+  records[], empty_slots[], seconds[] }`. Invariants worth keeping:
+  - Slot assignment is integer math on device ticks
+    (`within_us * slots / 1_000_000`), the exact form of the browser occupancy
+    formula `floor((t − second_start) * slots + 1e-6)`; a test asserts both agree
+    per second on `capture_v8.bin`.
+  - All deltas, the empty-slot classification (`DiagnosticCause` → layer), and
+    the per-second statistics are computed in Rust, so the same numbers can be
+    exported with `--json`. The web layer only formats them.
+  - `capture_end` distinguishes an offline capture from a live window edge;
+    trailing slots without a closing record stay `ambiguous` either way, and
+    `seconds[].partial` marks a second the trace does not fully cover.
+  - Offline files need `--pps` (`from_file_with_pps`); without it the grid falls
+    back to `effective_pps` and shrinks exactly for the seconds that miss samples.
+  - Cost: a 34 s capture at 100 slots adds ~1 MB of diagnostics to the payload.
 
 ---
 

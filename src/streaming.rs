@@ -41,7 +41,8 @@ use crate::{
     collection::{self, CollectionConfig, CollectionError, CollectionSummary},
     decoder::{CsiPacket, DecodeError, FrameStreamDecoder},
     visualization::{
-        self, LiveDashboardSnapshot, VisualizationError, prepare_visualization_data_with_origin,
+        self, LiveDashboardSnapshot, VisualizationError, VisualizationOptions,
+        prepare_visualization_data_with_options,
     },
 };
 
@@ -460,11 +461,17 @@ impl LiveAccumulator {
             StreamingError::State("origin timestamp missing from live buffer".to_string())
         })?;
 
-        let data = prepare_visualization_data_with_origin(
+        // The published window is a sliding slice, so its last record is not
+        // the end of the capture: the diagnostic trace must treat the trailing
+        // slots as a window edge, not as a capture edge.
+        let data = prepare_visualization_data_with_options(
             &self.packets,
             self.source.as_deref(),
             origin_ticks,
-            Some(self.nominal_pps),
+            VisualizationOptions {
+                nominal_pps: Some(self.nominal_pps),
+                capture_end: false,
+            },
         )?;
 
         self.set_state(LiveDashboardSnapshot::Ready {
