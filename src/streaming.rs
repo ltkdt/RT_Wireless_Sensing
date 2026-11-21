@@ -74,6 +74,14 @@ pub struct StreamingConfig {
     pub update_interval: Duration,
     /// Maximum amount of device time retained and displayed.
     pub window: Duration,
+    /// Attach the diagnostic trace to every published snapshot.
+    ///
+    /// Off by default: the trace costs roughly 1 MB of JSON per poll, which is
+    /// wasted when the diagnostic toggle is never used. Enable it with
+    /// `--diagnostics`; when off, the payload carries `diagnostics: null` and
+    /// the web UI hides the toggle. Occupancy (click-to-compute) is unaffected
+    /// because it is derived from the timestamps in the browser.
+    pub diagnostics: bool,
 }
 
 impl Default for StreamingConfig {
@@ -89,6 +97,9 @@ impl Default for StreamingConfig {
             warmup: DEFAULT_WARMUP,
             update_interval: DEFAULT_UPDATE_INTERVAL,
             window: DEFAULT_WINDOW,
+            // A live dashboard publishes every 500 ms; the diagnostic trace is
+            // opt-in so the default poll stays small.
+            diagnostics: false,
         }
     }
 }
@@ -395,6 +406,7 @@ struct LiveAccumulator {
     started: Instant,
     state: Arc<RwLock<LiveDashboardSnapshot>>,
     total_decoded: u64,
+    diagnostics: bool,
 }
 
 impl LiveAccumulator {
@@ -422,6 +434,7 @@ impl LiveAccumulator {
             started,
             state,
             total_decoded: 0,
+            diagnostics: config.diagnostics,
         }
     }
 
@@ -471,6 +484,7 @@ impl LiveAccumulator {
             VisualizationOptions {
                 nominal_pps: Some(self.nominal_pps),
                 capture_end: false,
+                diagnostics: self.diagnostics,
             },
         )?;
 

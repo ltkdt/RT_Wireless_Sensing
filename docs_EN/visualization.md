@@ -110,6 +110,13 @@ and `seconds[].partial` mark those edges.
 `summary` is `#[serde(default)]`: a payload written before the field existed
 still parses, and the web layer then aggregates `empty_slots` itself.
 
+The whole `diagnostics` field is optional. Offline payloads (`visualize`,
+`VisualizationData::from_file*`, `prepare_visualization_data*`) always carry it;
+the live dashboard only builds it when started with `--diagnostics`, because it
+costs about 1 MB per poll. When absent, the payload carries
+`"diagnostics": null` and the web layer hides the toggle — the amplitude heatmap
+and the browser-side occupancy readout are unaffected.
+
 #### Slot semantics
 
 `slot = floor((device_ticks_us − second_start) × slots / 1_000_000)`, computed

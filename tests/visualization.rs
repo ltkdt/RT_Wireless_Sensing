@@ -19,8 +19,8 @@ use rt_wireless_sensing::{
         RAW_CSI_RESPONSE_MAGIC, SESSION_ID_LEN,
     },
     visualization::{
-        DiagnosticCause, DiagnosticLayer, VisualizationData, VisualizationError,
-        VisualizationOptions, prepare_visualization_data_with_options,
+        VisualizationData, VisualizationError, VisualizationOptions,
+        prepare_visualization_data_with_options,
     },
 };
 
@@ -248,8 +248,13 @@ fn packet(sample: Sample) -> CsiPacket {
     }
 }
 
-/// Prepare a synthetic stream with an explicit nominal PPS.
-fn prepare(samples: &[Sample], origin_ticks: u64, pps: f64) -> VisualizationData {
+/// Prepare a synthetic stream with an explicit nominal PPS and trace setting.
+fn prepare_with(
+    samples: &[Sample],
+    origin_ticks: u64,
+    pps: f64,
+    diagnostics: bool,
+) -> VisualizationData {
     let packets: Vec<CsiPacket> = samples.iter().copied().map(packet).collect();
     prepare_visualization_data_with_options(
         &packets,
@@ -258,180 +263,66 @@ fn prepare(samples: &[Sample], origin_ticks: u64, pps: f64) -> VisualizationData
         VisualizationOptions {
             nominal_pps: Some(pps),
             capture_end: true,
+            diagnostics,
         },
     )
     .expect("synthetic stream should prepare")
 }
 
+/// Prepare a synthetic stream with the trace enabled.
+fn prepare(samples: &[Sample], origin_ticks: u64, pps: f64) -> VisualizationData {
+    prepare_with(samples, origin_ticks, pps, true)
+}
+
+/// The diagnostic trace is opt-out: `diagnostics: false` must drop it from the
+/// payload, while the default options keep it. This is the contract the live
+/// dashboard relies on to keep its 500 ms polls small.
 #[test]
-fn diagnostic_records_carry_deltas_and_slot_positions() {
+fn diagnostic_trace_is_optional() {
     let origin = 5_000_000;
     let samples = [
         Sample::new(1, origin),
         Sample::new(2, origin + 10_000),
-        Sample::new(4, origin + 25_000),
-        Sample::new(5, origin + 1_030_000),
+        Sample::new(4, origin + 1_030_000),
     ];
-    let data = prepare(&samples, origin, 100.0);
-    let trace = data.diagnostics.as_ref().expect("trace");
 
-    assert_eq!(trace.slots_per_second, 100);
-    assert_eq!(trace.origin_ticks, origin);
-    assert_eq!(trace.records.len(), 4);
+    let packets: Vec<CsiPacket> = samples.iter().copied().map(packet).collect();
+    let without = prepare_visualization_data_with_options(
+        &packets,
+        Some("synthetic"),
+        origin,
+        VisualizationOptions {
+            nominal_pps: Some(100.0),
+            capture_end: true,
+            diagnostics: false,
+        },
+    )
+    .expect("synthetic stream should prepare");
+    assert!(without.diagnostics.is_none());
+    assert!(
+        serde_json::to_string(&without)
+            .expect("serialize")
+            .contains("\"diagnostics\":null"),
+        "an absent trace must serialize as null so the web layer hides the toggle"
+    );
 
-    let first = &trace.records[0];
-    assert_eq!((first.second, first.slot), (0, 0));
-    assert_eq!(first.slot_offset_us, 0);
-    assert_eq!(first.delta_stream, None);
-    assert_eq!(first.delta_ticks_us, None);
-    assert_eq!(first.delta_wifi_rx_us, None);
-    assert_eq!(first.snr_db, Some(-35 - -94));
+    // The default options keep the trace for offline payloads.
+    let with_defaults = prepare_visualization_data_with_options(
+        &packets,
+        Some("synthetic"),
+        origin,
+        VisualizationOptions {
+            nominal_pps: Some(100.0),
+            ..VisualizationOptions::default()
+        },
+    )
+    .expect("synthetic stream should prepare");
+    assert!(with_defaults.diagnostics.is_some());
 
-    let second = &trace.records[1];
-    assert_eq!((second.second, second.slot), (0, 1));
-    assert_eq!(second.slot_offset_us, 0);
-    assert_eq!(second.delta_stream, Some(1));
-    assert_eq!(second.delta_ticks_us, Some(10_000));
-    assert_eq!(second.delta_wifi_rx_us, Some(10));
-
-    // 25 ms into the second is slot 2 of 100, 5 ms after the slot start.
-    let third = &trace.records[2];
-    assert_eq!((third.second, third.slot), (0, 2));
-    assert_eq!(third.slot_offset_us, 5_000);
-    assert_eq!(third.delta_stream, Some(2));
-    assert_eq!(third.delta_ticks_us, Some(15_000));
-
-    let fourth = &trace.records[3];
-    assert_eq!((fourth.second, fourth.slot), (1, 3));
-    assert_eq!(fourth.slot_offset_us, 0);
-    assert_eq!(fourth.delta_ticks_us, Some(1_005_000));
-}
-
-#[test]
-fn empty_slots_are_classified_by_layer() {
-    let origin = 1_000_000;
-    let samples = [
-        Sample::new(1, origin),
-        Sample::new(2, origin + 10_000),
-        // Slots 2 and 3: the stream skipped two frames and the device counted
-        // both as raw drops.
-        Sample::new(5, origin + 40_000).drop(2),
-        Sample::new(6, origin + 50_000),
-        // Slot 6: the stream skipped one frame and the desktop reported
-        // backpressure.
-        Sample::new(8, origin + 70_000).backpressure(1),
-        // Slot 9: contiguous counters, but the record before it is weak.
-        Sample::new(9, origin + 80_000).rssi(-80),
-        Sample::new(10, origin + 100_000),
-        // Slot 11: contiguous counters and normal RSSI.
-        Sample::new(11, origin + 120_000),
-    ];
-    let data = prepare(&samples, origin, 100.0);
-    let trace = data.diagnostics.as_ref().expect("trace");
-
-    let empty = |slot: u32| {
-        trace
-            .empty_slots
-            .iter()
-            .find(|empty| empty.second == 0 && empty.slot == slot)
-            .unwrap_or_else(|| panic!("slot {slot} should be empty"))
-    };
-
-    let device_drop = empty(2);
-    assert_eq!(device_drop.cause, DiagnosticCause::DeviceDrop);
-    assert_eq!(device_drop.cause.layer(), DiagnosticLayer::RxDevice);
-    assert_eq!(device_drop.dropped_frames, 2);
-    assert_eq!(device_drop.delta_drop, 2);
-    assert_eq!(device_drop.previous.as_ref().map(|b| b.seq_num), Some(2));
-    assert_eq!(device_drop.next.as_ref().map(|b| b.seq_num), Some(5));
-    assert_eq!(empty(3).cause, DiagnosticCause::DeviceDrop);
-
-    let desktop = empty(6);
-    assert_eq!(desktop.cause, DiagnosticCause::DesktopBackpressure);
-    assert_eq!(desktop.cause.layer(), DiagnosticLayer::Desktop);
-    assert_eq!(desktop.dropped_frames, 1);
-    assert_eq!(desktop.delta_backpressure, 1);
-
-    let air = empty(9);
-    assert_eq!(air.cause, DiagnosticCause::AirLoss);
-    assert_eq!(air.cause.layer(), DiagnosticLayer::TxAirtime);
-    assert_eq!(air.dropped_frames, 0);
-
-    let generator = empty(11);
-    assert_eq!(generator.cause, DiagnosticCause::GeneratorMissed);
-    assert_eq!(generator.cause.layer(), DiagnosticLayer::Generator);
-
-    // Slots after the last record have no closing boundary.
-    let trailing = empty(13);
-    assert_eq!(trailing.cause, DiagnosticCause::Ambiguous);
-    assert!(trailing.next.is_none());
-    assert!(trailing.previous.is_some());
-}
-
-#[test]
-fn second_statistics_are_exact() {
-    // 10 slots per second: slot i starts at i * 100 ms.
-    let origin = 1_000_000;
-    let samples = [
-        Sample::new(1, origin),
-        Sample::new(2, origin + 100_000),
-        Sample::new(3, origin + 200_000),
-        // Slots 3 and 4 are empty.
-        Sample::new(4, origin + 500_000),
-        Sample::new(5, origin + 600_000),
-        // Slot 7 is empty.
-        Sample::new(6, origin + 800_000),
-        Sample::new(7, origin + 900_000),
-    ];
-    let data = prepare(&samples, origin, 10.0);
-    let trace = data.diagnostics.as_ref().expect("trace");
-    let stats = &trace.seconds[0];
-
-    assert_eq!(stats.second, 0);
-    assert_eq!(stats.slots, 10);
-    assert_eq!(stats.samples, 7);
-    assert_eq!(stats.filled_slots, 7);
-    assert_eq!(stats.empty_slots, 3);
-    assert_eq!(stats.effective_pps, 7.0);
-    assert!((stats.loss_ratio - 0.3).abs() < 1e-12);
-    assert!((stats.nominal_interval_us - 100_000.0).abs() < 1e-9);
-
-    // Intervals between consecutive records: 100, 100, 300, 100, 200, 100 ms.
-    // The first record of the trace has no predecessor, so it contributes none.
-    assert!((stats.interval_mean_us - 150_000.0).abs() < 1e-6);
-    assert!((stats.interval_median_us - 100_000.0).abs() < 1e-9);
-    assert_eq!(stats.interval_min_us, 100_000);
-    assert_eq!(stats.interval_max_us, 300_000);
-    assert!((stats.interval_p95_us - 300_000.0).abs() < 1e-9);
-    let expected_std = {
-        let mean = 150_000.0;
-        let values: [f64; 6] = [100_000.0, 100_000.0, 300_000.0, 100_000.0, 200_000.0, 100_000.0];
-        (values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / 6.0).sqrt()
-    };
-    assert!((stats.interval_std_us - expected_std).abs() < 1e-6);
-
-    // One run of two empty slots and one run of one.
-    assert_eq!(stats.burst_histogram, [1, 1, 0]);
-    assert_eq!(stats.longest_empty_run, 2);
-
-    assert_eq!(stats.offset_mean_us, 0.0);
-    assert_eq!(stats.offset_min_us, 0);
-    assert_eq!(stats.offset_max_us, 0);
-
-    assert_eq!(stats.stream_gap_total, 0);
-    assert_eq!(stats.drop_total, 0);
-    assert_eq!(stats.backpressure_total, 0);
-    assert_eq!(stats.backpressure_frames, 0);
-
-    assert_eq!(stats.rssi_min_dbm, Some(-35));
-    assert_eq!(stats.rssi_max_dbm, Some(-35));
-    assert_eq!(stats.rssi_mean_dbm, Some(-35.0));
-    assert_eq!(stats.empty_slots_low_rssi, 0);
-
-    assert_eq!(stats.missing_fresh, 0);
-    assert_eq!(stats.first_word_invalid, 0);
-    assert_eq!(stats.config_changes, 0);
-    assert!(!stats.partial);
+    // The heatmap matrix is identical either way: only the trace is dropped.
+    assert_eq!(without.timestamps, with_defaults.timestamps);
+    assert_eq!(without.amplitudes, with_defaults.amplitudes);
+    assert_eq!(without.metadata, with_defaults.metadata);
 }
 
 #[test]

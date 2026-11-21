@@ -537,7 +537,7 @@ impl fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-/// Bounds-checked little-endian reader over a byte slice.
+/// Bounds-checked little-endian reader over a byte slice. Le stands for "Little-endian".
 ///
 /// Every read is explicit about byte order and length. `base` turns a relative
 /// position into an absolute offset for error reporting.
@@ -558,7 +558,7 @@ impl<'a> LeReader<'a> {
 
     /// Absolute offset of the next unread byte.
     fn offset(&self) -> u64 {
-        self.base + self.pos as u64
+        self.base + self.pos as u64 // base is absolute, pos is relative to the slice
     }
 
     /// Return the next `count` bytes and advance the cursor.
@@ -585,6 +585,8 @@ impl<'a> LeReader<'a> {
     fn skip(&mut self, count: usize, context: &'static str) -> Result<(), DecodeError> {
         self.take(count, context).map(|_| ())
     }
+
+    //Implement the reader for specific types. Each method reads the next bytes, interprets them as the type, and advances the cursor.
 
     fn u8(&mut self, context: &'static str) -> Result<u8, DecodeError> {
         Ok(self.take(1, context)?[0])

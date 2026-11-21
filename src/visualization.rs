@@ -1040,6 +1040,15 @@ pub struct VisualizationOptions {
     /// the end of the capture; the diagnostic trace uses this flag to tell a
     /// window edge from a capture edge.
     pub capture_end: bool,
+    /// `true` to attach the diagnostic trace to the payload.
+    ///
+    /// The trace costs roughly 1 MB per 34 s of capture at 100 slots, so a live
+    /// dashboard keeps it off by default and only builds it when the user asks
+    /// for it. Offline payloads leave this at `true`. When it is `false`,
+    /// `VisualizationData::diagnostics` is `None` and the web UI hides the
+    /// diagnostic toggle; the occupancy readout is unaffected because it uses
+    /// the timestamps, not the trace.
+    pub diagnostics: bool,
 }
 
 impl Default for VisualizationOptions {
@@ -1047,6 +1056,7 @@ impl Default for VisualizationOptions {
         Self {
             nominal_pps: None,
             capture_end: true,
+            diagnostics: true,
         }
     }
 }
@@ -1096,6 +1106,7 @@ pub fn prepare_visualization_data_with_origin(
         VisualizationOptions {
             nominal_pps,
             capture_end: true,
+            ..VisualizationOptions::default()
         },
     )
 }
@@ -1187,14 +1198,12 @@ pub fn prepare_visualization_data_with_options(
 
     // The diagnostic toggle is gated on the presence of this field, and the
     // slot-grid column count is passed explicitly (nominal PPS rounded once
-    // here) so the web UI does not re-derive it.
-    let slots_per_second = nominal_pps.round().max(1.0) as usize;
-    let diagnostics = Some(build_diagnostic_trace(
-        packets,
-        origin_ticks,
-        slots_per_second,
-        options.capture_end,
-    ));
+    // here) so the web UI does not re-derive it. Building the trace is opt-out:
+    // a live dashboard leaves it disabled to keep the payload small.
+    let diagnostics = options.diagnostics.then(|| {
+        let slots_per_second = nominal_pps.round().max(1.0) as usize;
+        build_diagnostic_trace(packets, origin_ticks, slots_per_second, options.capture_end)
+    });
 
     Ok(VisualizationData {
         metadata,
@@ -1244,6 +1253,7 @@ impl VisualizationData {
             VisualizationOptions {
                 nominal_pps,
                 capture_end: true,
+                diagnostics: true,
             },
         )
     }

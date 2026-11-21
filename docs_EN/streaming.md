@@ -43,7 +43,13 @@ so the page is available immediately; the raw capture is written to
 | `--output FILE` | `capture_v8.bin` | Raw capture file |
 | `--port PORT` | `8080` | Dashboard port on `127.0.0.1` |
 | `--verbose` | off | Print per-chunk collection progress |
+| `--diagnostics` | off | Attach the diagnostic trace to every refresh (~1 MB per poll at 100 slots) |
 | `-h, --help` | — | Show usage |
+
+The diagnostic toggle in the web UI needs `--diagnostics` in live mode: without
+it the payload carries `"diagnostics": null` and the toggle is hidden. Occupancy
+(click-to-compute) is unaffected either way, because it is derived in the browser
+from the timestamps.
 
 ## Timing behavior
 
@@ -93,11 +99,15 @@ pub struct StreamingConfig {
     pub warmup: Duration,             // default 3 s
     pub update_interval: Duration,    // default 500 ms
     pub window: Duration,             // default 30 s
+    pub diagnostics: bool,            // default false
 }
 ```
 
 - `StreamingConfig::default()` uses the standard ESP32 address, 20 PPS, and
   `capture_v8.bin`. Per-chunk collection logging is off by default.
+- `diagnostics` is off by default: every published snapshot then carries
+  `"diagnostics": null` instead of a ~1 MB trace. Set it to `true` (or pass
+  `--diagnostics`) to enable the diagnostic view in the web UI.
 - `config.bind_addr()` returns `127.0.0.1:<port>`.
 
 ### `run`

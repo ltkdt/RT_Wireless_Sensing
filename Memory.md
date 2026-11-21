@@ -154,6 +154,42 @@ record, from `device_ticks_us`) plus `amplitude_00..63` and `phase_00..63` —
     The field is `#[serde(default)]`, and the web layer re-aggregates
     `empty_slots` when it is absent.
   - Cost: a 34 s capture at 100 slots adds ~1 MB of diagnostics to the payload.
+  - **Live streaming is opt-in (implemented).** Offline payloads (`visualize`,
+    `from_file*`, `prepare_visualization_data*`) always carry `diagnostics`
+    (`VisualizationOptions::diagnostics = true` by default). Streaming defaults to
+    **no** trace (`StreamingConfig::diagnostics = false`) and only builds it with
+    `--diagnostics`, saving ~1 MB per 500 ms poll. The web layer hides the toggle
+    when the field is `null`; occupancy is unaffected (browser-side timestamps).
+  - Test policy: the diagnostic tests that constructed `VisualizationOptions`
+    directly were removed rather than migrated — mapping the flag is the only
+    thing needed from them. `diagnostic_trace_is_optional` in
+    `tests/visualization.rs` is the contract for this change.
+
+#### Opt-in rule for computed view features (project-wide)
+
+Any viewing feature whose data must be **computed** ships **off by default in
+streaming mode** and is turned on only by an explicit CLI argument. Reason: the
+server re-publishes its whole payload every 500 ms while streaming, so every
+computed block is paid for on every poll whether the user ever opens the panel or
+not — the diagnostic trace alone costs ~1 MB per poll (34 s × 100 slots).
+
+- **Offline is exempt**: `visualize` / `from_file*` produce one payload for one
+  file, so the cost is paid once. Computed data defaults to **on** there (this is
+  why `VisualizationOptions::diagnostics` defaults to `true` while
+  `StreamingConfig::diagnostics` defaults to `false`).
+- **Implement it as a payload switch, not a web switch.** The field is `None` /
+  `null` when disabled and the web layer hides the panel; it never recomputes the
+  numbers browser-side. This keeps one implementation of every formula (Rust),
+  and the hiding rule is already established (`web/visualizer.js` gates panels on
+  the presence of their payload field).
+- Enablement is a boolean on `StreamingConfig` + a `--<feature>` flag in
+  `src/bin/streaming.rs`; document it in `docs_EN`/`docs_VN` `streaming.md`.
+- Disabling must not change the base payload: the heatmap matrix, timestamps and
+  metadata are identical either way (asserted in `diagnostic_trace_is_optional`).
+- **Planned application: a DSP panel** (driven by the `dsp` module — FFT/STFT,
+  filtering, resampling) is in planning phase with no approved plan yet. When it
+  lands it follows this rule: computed spectra/filter outputs off by default in
+  streaming, enabled by a CLI flag; always present for offline files.
 
 ---
 

@@ -136,7 +136,7 @@ impl CollectionConfig {
         Duration::from_millis((1_000 / u64::from(self.pps.max(1))).max(1))
     }
 
-    /// Address that receives the UDP markers.
+    /// Address that receives the UDP markers, which is [`Self::esp32_ip`] and [`Self::marker_port`].
     pub fn marker_target(&self) -> Result<SocketAddr, CollectionError> {
         let endpoint = format!("{}:{}", self.esp32_ip, self.marker_port);
         endpoint
@@ -264,7 +264,7 @@ impl Drop for AbortOnDrop {
 /// I/O/HTTP error. Dropping the future aborts the HTTP request and the
 /// marker task.
 pub async fn collect(config: &CollectionConfig) -> Result<CollectionSummary, CollectionError> {
-    collect_with_sink(config, |_| {}).await
+    collect_with_sink(config, |_| {}).await // Pass empty closure as the chunk callback.
 }
 
 /// Collect the CSI stream and call `on_chunk` for every response chunk.
@@ -362,7 +362,7 @@ async fn stream_to_file<F>(
     on_chunk: &mut F,
 ) -> Result<(u64, Duration), CollectionError>
 where
-    F: FnMut(&[u8]),
+    F: FnMut(&[u8]), // F is a synchronous callback that runs on the collection task.
 {
     let response = client
         .get(format!("{base}/csi"))

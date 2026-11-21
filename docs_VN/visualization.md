@@ -107,6 +107,13 @@ thuộc capture, nên không được tính là đầy hay trống; `capture_end
 `summary` mang `#[serde(default)]`: payload được ghi trước khi trường này tồn tại
 vẫn parse được, và khi đó lớp web tự gộp `empty_slots`.
 
+Toàn bộ trường `diagnostics` là tùy chọn. Payload ngoại tuyến (`visualize`,
+`VisualizationData::from_file*`, `prepare_visualization_data*`) luôn mang trường
+này; bảng điều khiển trực tiếp chỉ dựng nó khi chạy với `--diagnostics`, vì nó
+tốn khoảng 1 MB mỗi lần poll. Khi không có, payload mang `"diagnostics": null`
+và lớp web ẩn công tắc — heatmap biên độ và phép tính độ chiếm chỗ phía trình
+duyệt không bị ảnh hưởng.
+
 #### Ngữ nghĩa khe
 
 `khe = floor((device_ticks_us − đầu_giây) × khe_mỗi_giây / 1_000_000)`, tính bằng

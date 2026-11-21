@@ -27,6 +27,8 @@ options:
   --output FILE       raw capture file (default: capture_v8.bin)
   --port PORT         dashboard HTTP port on 127.0.0.1 (default: 8080)
   --verbose           print per-chunk collection progress
+  --diagnostics       attach the diagnostic trace to every dashboard refresh
+                      (~1 MB per poll at 100 slots; off by default)
   -h, --help          show this help
 
 The dashboard is available at http://127.0.0.1:<port> as soon as the command
@@ -83,6 +85,7 @@ where
         match arg.as_str() {
             "-h" | "--help" => return Ok(ParsedArgs::Help),
             "--verbose" => config.collection.verbose = true,
+            "--diagnostics" => config.diagnostics = true,
             "--ip" => config.collection.esp32_ip = value(&mut args, "--ip")?,
             "--origin" => config.collection.origin = value(&mut args, "--origin")?,
             "--output" => {

@@ -43,7 +43,13 @@ vì vậy trang có sẵn ngay lập tức; bản ghi thô được ghi vào
 | `--output FILE` | `capture_v8.bin` | Tệp ghi thô |
 | `--port PORT` | `8080` | Cổng bảng điều khiển trên `127.0.0.1` |
 | `--verbose` | tắt | In tiến độ thu thập theo chunk |
+| `--diagnostics` | tắt | Đính kèm trace chẩn đoán vào mỗi lần làm mới (~1 MB mỗi poll ở 100 khe) |
 | `-h, --help` | — | Hiển thị cách sử dụng |
+
+Công tắc chế độ chẩn đoán trên giao diện web cần `--diagnostics` khi chạy trực
+tiếp: nếu không có, payload mang `"diagnostics": null` và công tắc bị ẩn. Độ
+chiếm chỗ (nhấp để tính) không bị ảnh hưởng trong cả hai trường hợp, vì nó được
+tính trong trình duyệt từ các mốc thời gian.
 
 ## Hành vi định thời
 
@@ -90,11 +96,15 @@ pub struct StreamingConfig {
     pub warmup: Duration,             // mặc định 3 giây
     pub update_interval: Duration,    // mặc định 500 ms
     pub window: Duration,             // mặc định 30 giây
+    pub diagnostics: bool,            // mặc định false
 }
 ```
 
 - `StreamingConfig::default()` sử dụng địa chỉ ESP32 tiêu chuẩn, 20 PPS, và
   `capture_v8.bin`. Ghi log thu thập theo chunk tắt theo mặc định.
+- `diagnostics` tắt theo mặc định: khi đó mỗi snapshot xuất bản mang
+  `"diagnostics": null` thay vì một trace cỡ ~1 MB. Đặt thành `true` (hoặc
+  truyền `--diagnostics`) để bật chế độ chẩn đoán trên giao diện web.
 - `config.bind_addr()` trả về `127.0.0.1:<port>`.
 
 ### `run`
