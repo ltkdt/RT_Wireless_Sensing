@@ -5,13 +5,22 @@ obvious from any single source file. Per-module usage and API reference live in
 `docs_EN/` (English) and `docs_VN/` (Vietnamese) and in rustdoc — do not duplicate
 them here. This file is not a changelog.
 
-> `PLAN.md` holds the current feature plan: the **Diagnostic view** for the
-> visualization module (PPS-deficit diagnosis, approved 2026-11-19). The old
-> DSP-rewrite plan is obsolete — DSP is implemented in `src/dsp/` and documented in
-> `docs_EN/dsp.md` / `docs_VN/dsp.md`.
+> `PLAN.md` holds the **Diagnostic view** plan (PPS-deficit diagnosis). Both of its
+> phases are implemented, and the follow-on **DSP view** (resampling +
+> normalization panels) is implemented too — see §2.7 for its decisions. Per-module
+> reference: `docs_EN/dsp.md`, `docs_EN/visualization.md` §6.
 
-Last updated: 2026-11-19 (diagnostic view phase 2 implemented: real per-record
-data, empty-slot classification, and per-second statistics computed in Rust)
+Last updated: 2026-11-22 (docs: `samples/capture_v8.bin` is now the current
+501-record desktop-as-AP sample, distinct from the 691-record capture the tests
+use; `scripts/` and `plot_data/` are gone — no Python tooling is in scope)
+
+Earlier: 2026-11-22 (Packet Rate card shows Nominal `--pps` next to the
+measured Effective PPS; `metadata.nominal_pps` is now `Option<f64>` and `null`
+when no `--pps` was given — see §2.6)
+
+Earlier: 2026-11-19 (DSP view implemented end-to-end: `resample_with` with gap
+segmentation, null-aware `normalize`, `DspView` payload, `--dsp-*` flags, read-only
+DSP panel in the web UI, full-recording CSV export)
 
 ---
 
@@ -32,22 +41,41 @@ src/
   visualization.rs  heatmap data prep + standalone HTML / HTTP server   (bin: visualize)
   streaming.rs      collect + live decode + dashboard in one process    (bin: streaming)
 web/                static frontend: index.html, style.css, visualizer.js (Canvas 2D, Viridis/Plasma/Jet)
-scripts/            verify_decoder.py (Rust-vs-Python differential check), inspect_espectre_data.py
 tests/              capture_v8.rs, dsp.rs, saving.rs, visualization.rs (integration)
-samples/            espectre_data/*.npz (labeled: free_space, standstill, wavehand_vert), raw_record/*.bin
+samples/            capture_v8.bin (current sample, 501 records @ 100 PPS, desktop-as-AP) + capture_v8_heatmap.html
+gallery/            dashboard screenshots embedded in README.md (main_ui, diagnostic_view_panel, dsp_view_panel)
 docs_EN/, docs_VN/  per-module docs in two languages
-artifacts/          git-ignored: capture_v8.bin, 50pps_test.bin, heatmap HTML, decoder output
+artifacts/          git-ignored: legacy capture_v8.bin (691 records @ 20 PPS), 50pps_test.bin, heatmap HTML, decoder output
 ```
+
+No Python tooling is part of this project. The former `scripts/` (ESPectre
+plotting/statistics helpers) and `plot_data/` (their output) were removed: they
+belonged to the ESPectre application, not to this one. This project consumes
+Espectre data its own way — it owns the schema, decoder, processing and
+presentation — and may build custom ESP32 firmware in the future.
 
 Pipeline: ESP32 → `collection` writes raw bytes → `decoder` parses frames →
 `saving` exports `.npz` → `dsp` processes offline; `visualization`/`streaming`
 render heatmaps (offline file or live).
 
-**Test data caveat (verified):** integration tests and the visualization unit tests
-read `capture_v8.bin` from the repo root (`CARGO_MANIFEST_DIR`), but the file is not
-tracked — a copy lives in the git-ignored `artifacts/`. Run
-`cp artifacts/capture_v8.bin .` before `cargo test --all-targets`, or those tests
-fail with "capture_v8.bin should exist".
+**Two different files share the name `capture_v8.bin` — do not conflate them:**
+
+| File | Records | Rate | Span | Session / device | Role in the project |
+|---|---|---|---|---|---|
+| `samples/capture_v8.bin` | **501** | 100.01 PPS | 4.999 s | `fbda2f63…` / `0xe3ec7259d2c354a3` | The **current** sample; `samples/capture_v8_heatmap.html` is rendered from it. Recorded with a **desktop machine as the AP**. |
+| repo-root `capture_v8.bin` (copy in git-ignored `artifacts/`) | **691** | 20.00 PPS | 34.499 s | `d95c15bb…` / `0xb78d3a15354ad161` | The **legacy** reference capture locked by the integration tests (§7, §8). |
+
+The name is kept only for the `capture_v8.bin` naming convention; the sample is
+not a newer encoding of the old capture.
+
+**Test data caveat (verified):** `tests/capture_v8.rs` and the visualization unit
+tests read `capture_v8.bin` from the repo root (`CARGO_MANIFEST_DIR`), **not** the
+sample in `samples/`. That file is not tracked — a copy lives in the git-ignored
+`artifacts/`. Run `cp artifacts/capture_v8.bin .` before
+`cargo test --all-targets`, or those tests fail with "capture_v8.bin should exist".
+The tests are pinned to the 691-record capture on purpose; swapping in the
+501-record sample would require updating their expected counts and payload hash
+(code change, deliberately not done here).
 
 ---
 
@@ -130,8 +158,23 @@ record, from `device_ticks_us`) plus `amplitude_00..63` and `phase_00..63` —
   into one standalone `.html` output or serves it over a Tokio HTTP server.
 - `streaming` defaults: port **8080**, warm-up **3 s**, refresh **500 ms**, sliding
   window **30 s** with absolute time labels. Clicking the heatmap reports occupancy
-  of that second as `N_filled / N` slots, where `N` = configured PPS
+  of that second as `N_filled / N` slots, where `N` = the requested `--pps`
   (`metadata.nominal_pps` drives the slot count).
+- **PPS metadata contract.** `metadata.nominal_pps: Option<f64>` is the `--pps`
+  *argument*; `metadata.effective_pps` is the rate *measured* as
+  `(frames − 1) / duration`. They are never interchangeable:
+  - `nominal_pps = None` means "no `--pps` given" (serialized as `null`). The UI
+    then shows the default nominal rate — `DEFAULT_NOMINAL_PPS = 20` in
+    `web/visualizer.js`, mirroring `collection::DEFAULT_PPS` — in a muted style
+    with a "no `--pps` argument" caption; it must never be presented as measured
+    or as requested.
+  - Rust still needs a concrete rate for the slot grids (occupancy, diagnostic
+    slots, DSP): `prepare_visualization_data_with_options` derives a local
+    `slot_pps = nominal_pps.unwrap_or(effective_pps)` for those computations,
+    leaving the *metadata* honest.
+  - The metadata card ("Packet Rate") always shows both rows: **Nominal** and
+    **Effective**. `getRequestedPps()` returns `null` when the argument is
+    absent; `getNominalPps()` is `getRequestedPps() ?? DEFAULT_NOMINAL_PPS`.
 - **Diagnostic view (phase 2, implemented).** `VisualizationData.diagnostics`
   carries `DiagnosticTrace { slots_per_second, origin_ticks, capture_end,
   records[], empty_slots[], seconds[], summary }`. Invariants worth keeping:
@@ -145,8 +188,9 @@ record, from `device_ticks_us`) plus `amplitude_00..63` and `phase_00..63` —
   - `capture_end` distinguishes an offline capture from a live window edge;
     trailing slots without a closing record stay `ambiguous` either way, and
     `seconds[].partial` marks a second the trace does not fully cover.
-  - Offline files need `--pps` (`from_file_with_pps`); without it the grid falls
-    back to `effective_pps` and shrinks exactly for the seconds that miss samples.
+  - Offline files need `--pps` (`from_file_with_pps`) to size the grid as
+    intended; without it `nominal_pps` stays `None` and the grid uses the default
+    nominal rate (20 PPS).
   - `summary` (capture overview) covers the **covered span only** — first to last
     received record — so `total_slots == filled_records + empty_slots` and the
     five `cause_counts` buckets partition `empty_slots`. `ambiguous` absorbs the
@@ -186,10 +230,44 @@ not — the diagnostic trace alone costs ~1 MB per poll (34 s × 100 slots).
   `src/bin/streaming.rs`; document it in `docs_EN`/`docs_VN` `streaming.md`.
 - Disabling must not change the base payload: the heatmap matrix, timestamps and
   metadata are identical either way (asserted in `diagnostic_trace_is_optional`).
-- **Planned application: a DSP panel** (driven by the `dsp` module — FFT/STFT,
-  filtering, resampling) is in planning phase with no approved plan yet. When it
-  lands it follows this rule: computed spectra/filter outputs off by default in
-  streaming, enabled by a CLI flag; always present for offline files.
+- **DSP view in the UI** is implemented and follows this rule exactly (decision
+  D1 below): `VisualizationOptions.dsp: Option<DspOptions>` defaults to `Some`,
+  `VisualizationData.dsp: Option<DspView>` is `#[serde(default)]`, and
+  `StreamingConfig` never computes it (`dsp: None`). See `docs_EN/dsp.md`
+  (`resample_with`) and `docs_EN/visualization.md` §6.
+
+### 2.7 DSP view decisions (D1–D5)
+
+- **D1 — streaming never computes DSP.** Resampling normalizes over the whole
+  record; a live tail would produce numbers that change retroactively. Live mode
+  ships `dsp: null` and the toggle is replaced by a note.
+- **D2 — the web layer is formatting only.** `interp` / `norm` / `max_gap_ms` are
+  baked into the payload at prepare time, so the DSP selectors are filled from
+  the payload and **disabled**. Changing them means re-running `visualize`; the
+  UI must never re-derive a panel.
+- **D3 — offline DSP on by default**, opt out with `--no-dsp`.
+- **D4 — null bins live in one table.** `NULL_BINS_HT20 = {0,1,2,3,32,61,62,63}`
+  for 64 subcarriers; `null_bins_for(n)` returns it only for `HT20_SUBCARRIERS`,
+  otherwise empty. A different standard needs a different table, so no call site
+  hard-codes the indices, and every subcarrier-axis statistic (`normalize`
+  `PerSubcarrier`/`PerSample`/`MinMax`) skips them.
+- **D5 — gaps split the interpolation, then get classified.** The source is cut
+  into segments at every gap over the threshold and each segment interpolated
+  independently (a natural cubic spline is a global fit — bridging a dropout
+  distorts its neighbours). Per column: `Observed` ≤ 1.5× median interval,
+  `Bridged` up to `max_gap_us`, `Masked` beyond it. `Masked` is withheld (NaN /
+  empty CSV cell), never filled with an invented value.
+- **`resample()` = `resample_with(…, ResampleOptions::default())`** — one
+  implementation; the wrapper exists only so old call sites are untouched, and a
+  test asserts the two are bit-identical without a threshold.
+- **Verified on the legacy 691-record capture** (repo-root `capture_v8.bin`,
+  20 PPS per record, resampled to 100 PPS): 3450 grid columns, step
+  exactly 0.01 s, span 0→34.49 s, so t = 1.0 s lands on grid index 100 and the
+  DSP grid aligns with the diagnostic slot grid. Column 0 reproduces the raw
+  amplitude exactly. 3424 observed / 26 bridged / 0 masked — the bridged run is
+  one real 251 ms dropout at frame 584 (≈ t 29.2 s); every other gap ≤ 54 ms.
+  (Measurements taken before `samples/capture_v8.bin` was replaced by the
+  current 501-record, desktop-as-AP sample; see §1.)
 
 ---
 
@@ -398,9 +476,12 @@ instead of raising on the first anomaly.
 
 ## 7. Verified facts about the reference capture
 
-`capture_v8.bin` (copy in `artifacts/`, recorded from an ESP32-C5 at 20 PPS),
-measured with a script mirroring the reference structs and cross-checked against
-ESPectre's real `tools.lib.csi_io` parser:
+The **legacy** `capture_v8.bin` (copy in `artifacts/`, recorded from an ESP32-C5
+at 20 PPS; this is the file the tests use — **not** the 501-record sample in
+`samples/`, see §1), measured with a script mirroring the reference structs and
+cross-checked against ESPectre's `tools.lib.csi_io` parser. That parser and the
+one-off verification script are external references only: no Python tooling is
+kept in this repository.
 
 | Property | Value |
 |---|---|
@@ -434,9 +515,11 @@ ESPectre's real `tools.lib.csi_io` parser:
 | Global amplitude mean / std | 24.768 / 10.369 |
 | First record, bin 4 | raw `[Q=5, I=-20]`, amp 20.615528, phase 2.896614 |
 
-**Cross-validation results:** Rust decoder vs ESPectre Python
-(`tools.lib.csi_io.parse_csi_record`): **691/691 records, 0 metadata mismatches**;
-`scripts/verify_decoder.py` made 15,899 field comparisons with 0 mismatches.
+**Cross-validation results (one-off, historical):** Rust decoder vs ESPectre's
+Python parser (`tools.lib.csi_io.parse_csi_record`): **691/691 records, 0
+metadata mismatches**, 15,899 field comparisons, 0 mismatches. The verification
+script lived in the now-removed `scripts/` and is not part of this project;
+re-running the check would mean re-creating it against ESPectre's own checkout.
 Demo decode run: 34.499 s, 20.00 records/s, 0 gaps, 0 drops, 0 backpressure.
 
 ---
@@ -453,7 +536,9 @@ cargo clippy --all-targets
   records, payload FNV `0x6446fc78e2c7f3e6`, byte-level first-record fields).
 - `tests/saving.rs` verifies the `.npz` layout and golden values;
   `tests/dsp.rs` and `tests/visualization.rs` cover the other modules.
-- `scripts/verify_decoder.py` re-runs the Rust-vs-Python differential check.
+- The Rust-vs-Python differential check is **not** runnable from this repo
+  (`scripts/verify_decoder.py` was removed with the Python tooling); the numbers
+  above are its historical result on the 691-record capture.
 
 ---
 
@@ -461,7 +546,16 @@ cargo clippy --all-targets
 
 - ONNX inference for localization is **not implemented**; it should consume
   decoded packets or the `.npz` arrays (README pipeline step 7).
-- Rendering DSP output (e.g. `Spectrogram` as a heatmap) inside the visualization
-  dashboard is a possible follow-up; `Spectrogram`/`Spectrum` are plain-data structs
-  so the visualization layer does not depend on dsp internals.
-- More captures can be validated with the ESPectre Python parser as a fuzz oracle.
+- The DSP view ships resampling + normalization only. Rendering **spectral**
+  output (`Spectrogram` / `Spectrum`) is still a possible follow-up; they are
+  plain-data structs, so the visualization layer does not depend on dsp internals.
+  Filtering (`hampel`, `bandpass`) and `csi_ratio` are likewise not exposed in the
+  view yet.
+- Export of the raw DSP arrays for further analysis outside the CSV is open; the
+  CSV is currently the only export path.
+- The tests are pinned to the legacy 691-record capture. Adopting
+  `samples/capture_v8.bin` (501 records, desktop-as-AP) as the test fixture would
+  mean updating their frame counts, payload hash and golden values, and deciding
+  how the sample is shipped (it is currently outside the ignored `artifacts/`).
+- Custom ESP32 firmware may be built in this repository in the future; today the
+  firmware is external and unmodified.

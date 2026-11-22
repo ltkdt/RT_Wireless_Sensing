@@ -57,11 +57,15 @@ pub struct VisualizationMetadata {
     pub subcarriers: usize,
     /// Effective sample rate in packets per second.
     pub effective_pps: f64,
-    /// Nominal packet rate used to divide a one-second interval into occupancy
-    /// slots. For live streaming this is the configured `--pps`; for a decoded
-    /// file it defaults to [`VisualizationMetadata::effective_pps`].
+    /// Nominal (requested) packet rate, i.e. the `--pps` argument, used to
+    /// divide a one-second interval into occupancy slots.
+    ///
+    /// `None` when no `--pps` argument was supplied: the dashboard then falls
+    /// back to a default nominal rate and the metadata card says so. The
+    /// measured rate is always available as
+    /// [`VisualizationMetadata::effective_pps`].
     #[serde(default)]
-    pub nominal_pps: f64,
+    pub nominal_pps: Option<f64>,
     /// Wi-Fi channel if available.
     pub channel: Option<u8>,
     /// Hex-formatted device identifier if available.
@@ -389,6 +393,74 @@ pub struct DiagnosticTrace {
     pub summary: DiagnosticSummary,
 }
 
+/// One panel of the DSP view: a `[time][subcarrier]` matrix plus what the web
+/// layer needs to render it (title, unit, colormap family).
+///
+/// The matrix is plain JSON (like [`VisualizationData::amplitudes`]) so the
+/// payload stays readable in `--json` exports and needs no new dependency.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DspPanel {
+    /// Stable identifier: `"amplitude"`, `"phase"` or `"amplitude_norm"`.
+    pub id: String,
+    /// Human-readable title shown above the canvas.
+    pub title: String,
+    /// Value unit: `"a.u."`, `"rad"` or `"z"`.
+    pub unit: String,
+    /// Colormap family the web layer must use: `"sequential"`,
+    /// `"cyclic"` (phase, wraps at ±π) or `"diverging"` (normalized, ±z).
+    pub kind: String,
+    /// `[time][subcarrier]` matrix, same shape as the resampled grid.
+    pub data: Vec<Vec<f32>>,
+}
+
+/// Precomputed DSP view of a capture: resampling onto a uniform grid plus an
+/// optional normalization, computed **once in Rust** when the payload is
+/// prepared.
+///
+/// The mask is separable — gaps are classified per time column
+/// ([`DspView::time_state`]) and null subcarriers per bin
+/// ([`DspView::null_subcarriers`]) — so no per-cell mask matrix is shipped.
+/// Streaming payloads carry `dsp: None`: DSP is never computed while a
+/// dashboard is live.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DspView {
+    /// Interpolation used for the resampling: `"nearest"`, `"linear"` or
+    /// `"cubic_spline"`.
+    pub interp: String,
+    /// Grid rate in Hz (the intended PPS), so column `j` maps to diagnostic
+    /// slot `(second = j / target_fs, slot = j % target_fs)`.
+    pub target_fs: f64,
+    /// Applied normalization (`"per_subcarrier"`, `"per_sample"`, `"min_max"`),
+    /// `None` when only resampling was asked for.
+    pub norm: Option<String>,
+    /// Gap threshold in milliseconds; `None` means every gap was bridged.
+    pub max_gap_ms: Option<f64>,
+    /// Resampled grid times in seconds from the first record.
+    pub timestamps: Vec<f64>,
+    /// Subcarrier indices that carry no channel information (guard/DC bins)
+    /// and must be masked by the renderer.
+    pub null_subcarriers: Vec<usize>,
+    /// Per grid column: `0` observed, `1` bridged, `2` masked.
+    pub time_state: Vec<u8>,
+    /// Panels to draw, in order: `amplitude`, `phase`, then `amplitude_norm`
+    /// when a normalization was applied.
+    pub panels: Vec<DspPanel>,
+}
+
+/// Options that control how the DSP view is computed.
+///
+/// Every field is a plain DSP enum so [`VisualizationOptions`] stays `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct DspOptions {
+    /// Interpolation method for the resampling.
+    pub interp: crate::dsp::InterpMethod,
+    /// Normalization applied *after* the resampling, if any.
+    pub norm: Option<crate::dsp::NormScheme>,
+    /// Maximum bridged gap in milliseconds; longer gaps are masked. `None`
+    /// (default) bridges every gap.
+    pub max_gap_ms: Option<f64>,
+}
+
 /// Complete dataset prepared for the web visualization layer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VisualizationData {
@@ -406,6 +478,13 @@ pub struct VisualizationData {
     /// payloads produced before the diagnostic view existed deserialize with
     /// `None` and the web UI keeps the diagnostic toggle hidden.
     pub diagnostics: Option<DiagnosticTrace>,
+    /// Optional precomputed DSP view (resampled and normalized panels).
+    ///
+    /// `#[serde(default)]` keeps payloads written before the DSP view existed
+    /// parseable; the web layer then hides the DSP toggle. Live dashboard
+    /// snapshots always carry `None`.
+    #[serde(default)]
+    pub dsp: Option<DspView>,
 }
 
 /// One state snapshot exposed by the live dashboard server.
@@ -478,6 +557,8 @@ pub enum VisualizationError {
     },
     /// JSON serialization failure.
     Serialization(serde_json::Error),
+    /// The `dsp` module rejected a request while building the DSP view.
+    Dsp(crate::dsp::DspError),
     /// Web server error.
     Server(String),
 }
@@ -519,6 +600,7 @@ impl fmt::Display for VisualizationError {
                 "record {record} subcarrier count changed: expected {expected}, found {found}"
             ),
             Self::Serialization(err) => write!(f, "JSON serialization error: {err}"),
+            Self::Dsp(err) => write!(f, "DSP error while building the DSP view: {err}"),
             Self::Server(msg) => write!(f, "web server error: {msg}"),
         }
     }
@@ -530,6 +612,7 @@ impl Error for VisualizationError {
             Self::Io(err) => Some(err),
             Self::Decode(err) => Some(err),
             Self::Serialization(err) => Some(err),
+            Self::Dsp(err) => Some(err),
             _ => None,
         }
     }
@@ -544,6 +627,12 @@ impl From<io::Error> for VisualizationError {
 impl From<DecodeError> for VisualizationError {
     fn from(err: DecodeError) -> Self {
         Self::Decode(err)
+    }
+}
+
+impl From<crate::dsp::DspError> for VisualizationError {
+    fn from(err: crate::dsp::DspError) -> Self {
+        Self::Dsp(err)
     }
 }
 
@@ -1049,6 +1138,13 @@ pub struct VisualizationOptions {
     /// diagnostic toggle; the occupancy readout is unaffected because it uses
     /// the timestamps, not the trace.
     pub diagnostics: bool,
+    /// `Some(options)` to attach the precomputed DSP view.
+    ///
+    /// Offline payloads default to `Some(DspOptions::default())`: the analysis
+    /// runs once, so it is exempt from the project-wide opt-in rule (streaming
+    /// never computes it). `--no-dsp` sets this to `None` to keep the payload
+    /// small; a live dashboard always uses `None`.
+    pub dsp: Option<DspOptions>,
 }
 
 impl Default for VisualizationOptions {
@@ -1057,6 +1153,7 @@ impl Default for VisualizationOptions {
             nominal_pps: None,
             capture_end: true,
             diagnostics: true,
+            dsp: Some(DspOptions::default()),
         }
     }
 }
@@ -1174,10 +1271,15 @@ pub fn prepare_visualization_data_with_options(
     } else {
         0.0
     };
+    // The requested rate is kept as-is: the dashboard displays it next to the
+    // measured one, and "no --pps argument" is reported as `None` rather than
+    // being silently replaced by the measurement.
     let nominal_pps = options
         .nominal_pps
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or(effective_pps);
+        .filter(|value| value.is_finite() && *value > 0.0);
+    // Slot grid (occupancy, diagnostics, DSP) needs a concrete rate; fall back
+    // to the measured rate when no `--pps` was given.
+    let slot_pps = nominal_pps.unwrap_or(effective_pps);
 
     let channel = Some(first.csi.channel);
     let device_id = Some(format!("0x{:08x}", first.csi.device_id));
@@ -1201,9 +1303,18 @@ pub fn prepare_visualization_data_with_options(
     // here) so the web UI does not re-derive it. Building the trace is opt-out:
     // a live dashboard leaves it disabled to keep the payload small.
     let diagnostics = options.diagnostics.then(|| {
-        let slots_per_second = nominal_pps.round().max(1.0) as usize;
+        let slots_per_second = slot_pps.round().max(1.0) as usize;
         build_diagnostic_trace(packets, origin_ticks, slots_per_second, options.capture_end)
     });
+
+    // The DSP view is computed once, here, from the same packets as the
+    // heatmap: Rust stays the only implementation of the formulas and the web
+    // layer only formats what it receives. The grid rate is the intended PPS,
+    // so resampled column `j` lines up with diagnostic slot `j`.
+    let dsp = match options.dsp {
+        Some(dsp_options) => Some(build_dsp_view(packets, slot_pps, dsp_options)?),
+        None => None,
+    };
 
     Ok(VisualizationData {
         metadata,
@@ -1211,7 +1322,122 @@ pub fn prepare_visualization_data_with_options(
         amplitudes,
         classification: None,
         diagnostics,
+        dsp,
     })
+}
+
+/// Build the [`DspView`] payload: resample onto the intended-PPS grid, then
+/// optionally normalize.
+///
+/// Panels shipped, in order: resampled `amplitude` and `phase`; then
+/// `amplitude_norm` when a normalization was requested (phase is left alone by
+/// [`crate::dsp::CsiSignal::normalize`], so it has no normalized counterpart).
+fn build_dsp_view(
+    packets: &[CsiPacket],
+    nominal_pps: f64,
+    options: DspOptions,
+) -> Result<DspView, VisualizationError> {
+    let target_fs = nominal_pps.round().max(1.0);
+    let max_gap_ms = options.max_gap_ms.filter(|ms| ms.is_finite() && *ms >= 0.0);
+    let max_gap_us = max_gap_ms.map(|ms| (ms * 1_000.0).round() as u64);
+
+    let signal = crate::dsp::CsiSignal::from_packets(packets)?;
+    let resampled = signal.resample_with(
+        target_fs,
+        options.interp,
+        crate::dsp::ResampleOptions { max_gap_us },
+    )?;
+
+    let grid = &resampled.signal;
+    let n = grid.n_samples();
+    let sc = grid.n_subcarriers();
+    let null_subcarriers = grid.null_bins.clone();
+
+    // A masked column never interpolates across a real record, so its cells are
+    // withheld: the renderer draws them hatched instead of as a value it would
+    // have to trust.
+    let time_state: Vec<u8> = resampled
+        .grid_state
+        .iter()
+        .map(|state| state.as_u8())
+        .collect();
+    let masked: Vec<bool> = resampled
+        .grid_state
+        .iter()
+        .map(|state| *state == crate::dsp::GridState::Masked)
+        .collect();
+
+    let to_matrix = |values: &ndarray::Array2<f64>| -> Vec<Vec<f32>> {
+        (0..n)
+            .map(|i| {
+                let mut row = Vec::with_capacity(sc);
+                for k in 0..sc {
+                    row.push(if masked[i] {
+                        f32::NAN
+                    } else {
+                        values[[i, k]] as f32
+                    });
+                }
+                row
+            })
+            .collect()
+    };
+
+    let mut panels = vec![
+        DspPanel {
+            id: "amplitude".to_string(),
+            title: "Amplitude — resampled".to_string(),
+            unit: "a.u.".to_string(),
+            kind: "sequential".to_string(),
+            data: to_matrix(&grid.amplitude),
+        },
+        DspPanel {
+            id: "phase".to_string(),
+            title: "Phase — resampled".to_string(),
+            unit: "rad".to_string(),
+            kind: "cyclic".to_string(),
+            data: to_matrix(&grid.phase),
+        },
+    ];
+
+    if let Some(scheme) = options.norm {
+        // Normalization runs on the resampled signal (base resampling stays the
+        // default view; a normalization is an extra panel on top of it).
+        let normalized = grid.normalize(scheme);
+        panels.push(DspPanel {
+            id: "amplitude_norm".to_string(),
+            title: "Amplitude — normalized".to_string(),
+            unit: if scheme == crate::dsp::NormScheme::MinMax {
+                "0–1".to_string()
+            } else {
+                "z".to_string()
+            },
+            kind: "diverging".to_string(),
+            data: to_matrix(&normalized.amplitude),
+        });
+    }
+
+    Ok(DspView {
+        interp: options.interp.as_str().to_string(),
+        target_fs,
+        norm: options.norm.map(norm_scheme_name),
+        max_gap_ms,
+        timestamps: grid.times_s().to_vec(),
+        null_subcarriers,
+        time_state,
+        panels,
+    })
+}
+
+/// Wire name of a normalization scheme (`"per_subcarrier"`, `"per_sample"`,
+/// `"min_max"`).
+fn norm_scheme_name(scheme: crate::dsp::NormScheme) -> String {
+    match scheme {
+        crate::dsp::NormScheme::PerSubcarrier => "per_subcarrier",
+        crate::dsp::NormScheme::PerSample => "per_sample",
+        crate::dsp::NormScheme::MinMax => "min_max",
+    }
+    .to_string()
 }
 
 impl VisualizationData {
@@ -1245,16 +1471,32 @@ impl VisualizationData {
         source_name: Option<&str>,
         nominal_pps: Option<f64>,
     ) -> Result<Self, VisualizationError> {
+        Self::from_bytes_with_options(
+            bytes,
+            source_name,
+            VisualizationOptions {
+                nominal_pps,
+                ..VisualizationOptions::default()
+            },
+        )
+    }
+
+    /// Load and decode from raw bytes with explicit [`VisualizationOptions`].
+    ///
+    /// This is the entry point the CLI uses: it can turn the DSP view off
+    /// ([`VisualizationOptions::dsp`] = `None`) or pick the interpolation,
+    /// normalization and gap threshold, all of which are fixed at prepare time.
+    pub fn from_bytes_with_options(
+        bytes: &[u8],
+        source_name: Option<&str>,
+        options: VisualizationOptions,
+    ) -> Result<Self, VisualizationError> {
         let packets = decode_packets(bytes)?;
         prepare_visualization_data_with_options(
             &packets,
             source_name,
             first_device_ticks(&packets),
-            VisualizationOptions {
-                nominal_pps,
-                capture_end: true,
-                diagnostics: true,
-            },
+            options,
         )
     }
 
@@ -1517,18 +1759,29 @@ mod tests {
                 .expect("window should prepare");
 
         assert_eq!(data.metadata.start_time_us, origin);
-        assert_eq!(data.metadata.nominal_pps, 20.0);
+        assert_eq!(data.metadata.nominal_pps, Some(20.0));
         assert_eq!(data.metadata.total_frames, window.len());
         assert!((data.timestamps[0] - expected).abs() < 1e-12);
         assert!(data.timestamps[0] > 4.0);
     }
 
     #[test]
-    fn nominal_pps_falls_back_to_the_effective_rate() {
+    fn nominal_pps_is_absent_without_a_pps_argument() {
         let packets = capture_packets();
         let data = prepare_visualization_data(&packets, None).expect("capture should prepare");
 
-        assert!((data.metadata.nominal_pps - data.metadata.effective_pps).abs() < 1e-12);
+        // No `--pps` was requested: the metadata reports that honestly so the
+        // dashboard can show a default next to the measured rate, while the
+        // slot grid still needs a concrete rate.
+        assert_eq!(data.metadata.nominal_pps, None);
+        assert!(data.metadata.effective_pps > 0.0);
+        let Some(trace) = data.diagnostics.as_ref() else {
+            panic!("the diagnostic trace is attached");
+        };
+        assert_eq!(
+            trace.slots_per_second,
+            data.metadata.effective_pps.round().max(1.0) as usize
+        );
     }
 
     #[tokio::test]

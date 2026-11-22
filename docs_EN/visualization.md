@@ -32,7 +32,15 @@ Displays key capture statistics alongside the heatmap:
 * **Start Time**: Relative start and monotonic device clock (`device_ticks_us`).
 * **Duration**: Total elapsed capture time in seconds.
 * **Decoded Frames**: Total valid CSI records ($N$).
-* **Effective Rate**: Packets per second (PPS) computed from device clock deltas.
+* **Packet Rate**: Two values side by side.
+  * **Nominal** — the requested `--pps` argument (`metadata.nominal_pps`). When
+    no `--pps` was supplied (`nominal_pps` is `null`), the card shows the default
+    nominal rate (20 PPS, `collection::DEFAULT_PPS` / `DEFAULT_NOMINAL_PPS` in
+    the web layer) in a muted style and says so in the caption; it never
+    presents the default as a requested value.
+  * **Effective** — the measured rate, `(frames − 1) / duration`, computed from
+    device clock deltas (`metadata.effective_pps`). It is always measured, never
+    a fallback for the nominal value.
 
 ### 3. Classification Results Area
 Provides a dedicated card displaying predicted activity or gesture classes (e.g. "Standby / None", "Walking", "Waving") with confidence levels when classification results are connected.
@@ -47,8 +55,10 @@ occupancy = (number of slots containing at least one measurement) / N
 ```
 
 The result is shown in the hover row as **Occupancy (click)**, e.g.
-`87.0% (87/100 @ 24s)`. The streaming command sets `N` from `--pps`; static
-captures use the measured effective PPS. The value is recomputed on each live
+`87.0% (87/100 @ 24s)`. `N` is the *nominal* rate: the streaming command passes
+`--pps` (`metadata.nominal_pps`), and a capture decoded without `--pps` falls
+back to the default nominal rate (20 PPS) — not to the measured rate, which is
+reported separately as effective PPS. The value is recomputed on each live
 data refresh and disappears when the second leaves the 30 s window.
 
 This is a browser-side calculation over the displayed `timestamps`; no extra
@@ -161,13 +171,104 @@ rather than guessed.
 
 #### `--pps` for offline files
 
-Without `--pps`, an offline file falls back to the measured effective rate,
-which shrinks the grid exactly for the seconds that miss samples. Pass the
-configured rate to keep the grid at the intended size:
+Without `--pps`, `metadata.nominal_pps` is `null` and the slot grid falls back
+to the default nominal rate (20 PPS), so a capture recorded faster than 20 PPS
+reports more than one measurement per slot. Pass the rate the capture was
+recorded at to align the grid, the occupancy readout, and the diagnostic slots
+with the intended size:
 
 ```bash
 cargo run --bin visualize -- capture_v8.bin --pps 100
 ```
+
+### 6. DSP view (resampling and normalization)
+
+An optional second panel set, computed **once in Rust** from the same decoded
+packets as the heatmap and embedded in the payload. It is available only for
+offline data: while a dashboard is streaming, `dsp` is `null` and the toggle is
+replaced by the note *"DSP analysis is available after streaming is closed."*
+
+The browser never resamples or normalizes. It only formats what Rust computed,
+so there is exactly one implementation of every formula.
+
+#### Panels
+
+| Panel | `kind` | Unit | What it is |
+|---|---|---|---|
+| `amplitude` | `sequential` | `a.u.` | Resampled $\lvert h_k(t)\rvert$ on the uniform grid |
+| `phase` | `cyclic` | `rad` | Resampled $\arg h_k(t)$, colour-mapped over $-\pi\ldots\pi$ |
+| `amplitude_norm` | `diverging` | `z` or `0–1` | Normalized amplitude; present only when a scheme was chosen |
+
+Phase is `atan2(Q, I)` on the interpolated I/Q values, never interpolated
+directly: raw phase wraps at $\pm\pi$, so interpolating it would create
+discontinuities that do not exist in the signal.
+
+The amplitude panel clips its colour scale to the 2nd–98th percentile and
+labels the full extent in the panel meta. A single multipath spike (this capture
+reaches 29 252 against a median of 26) would otherwise pin the scale and
+collapse 99% of the data into one colour.
+
+#### Grid
+
+The grid rate is `slots_per_second` (the nominal PPS rounded once in Rust), so
+resampled column `j` maps to diagnostic slot `(second = j / N, slot = j % N)`.
+The diagnostic slot grid and the DSP panels therefore line up exactly.
+
+#### Masking
+
+The mask is **separable**, so no per-cell matrix is shipped:
+
+- **Null subcarriers** (`null_subcarriers`): the eight guard/DC bins of a
+  centred HT20 capture, `{0,1,2,3,32,61,62,63}`. They never carry channel
+  information, are never rendered as a real `0`, and are excluded from every
+  transform across the subcarrier axis (`normalize` with `PerSample` computes
+  its mean and deviation over the non-null columns only). The panel has a
+  **Hide null subcarriers** option; y-axis ticks keep physical bin indices.
+- **Time columns** (`time_state`): `0` observed, `1` bridged, `2` masked.
+  A column is *bridged* when it was interpolated across a gap longer than 1.5
+  nominal intervals, and *masked* when that gap exceeds `max_gap_ms`. Masked
+  cells are withheld — rendered hatched and exported as empty — not filled with
+  an invented value.
+
+When a gap threshold is set, the source series is split at every over-threshold
+gap and each segment is interpolated independently. A natural cubic spline is a
+global fit, so interpolating across a dropout and masking afterwards would let
+that dropout distort its neighbours.
+
+#### Time window
+
+Every DSP canvas shares one time-window selector (default 30 s, maximum 5
+minutes). It is a **canvas restriction only**: the recording and the CSV export
+always keep every grid column.
+
+#### CSV export
+
+Each panel has an **Export CSV** button. The file covers the **full recording**,
+not the visible window: one row per grid column, one column per subcarrier,
+preceded by `#` provenance lines (`interp`, `target_fs`, `norm`, `max_gap_ms`,
+source) so it loads directly with `pandas.read_csv(path, comment='#')`. Masked
+cells are left empty, and the `time_state` column says why.
+
+#### Payload
+
+```json
+"dsp": {
+  "interp": "cubic_spline",
+  "target_fs": 100.0,
+  "norm": null,
+  "max_gap_ms": null,
+  "timestamps": [0.0, 0.01, "…"],
+  "null_subcarriers": [0, 1, 2, 3, 32, 61, 62, 63],
+  "time_state": [0, 0, 1, "…"],
+  "panels": [
+    { "id": "amplitude", "title": "Amplitude — resampled", "unit": "a.u.", "kind": "sequential", "data": [["…"]] },
+    { "id": "phase", "title": "Phase — resampled", "unit": "rad", "kind": "cyclic", "data": [["…"]] }
+  ]
+}
+```
+
+`dsp` is `#[serde(default)]`, so payloads written before this feature parse
+with `null` and the web UI simply hides the toggle.
 
 ## Standalone CLI
 
@@ -192,7 +293,11 @@ cargo run --bin visualize -- capture_v8.bin --serve --port 8080
 | `FILE` | Raw capture file written by `collect` (default: `capture_v8.bin`) |
 | `-o, --output FILE` | Destination path for standalone HTML dashboard (default: `<stem>_heatmap.html`) |
 | `--json FILE` | Path to export JSON visualization data |
-| `--pps PPS` | Nominal packet rate for the diagnostic slot grid (default: measured effective rate) |
+| `--pps PPS` | Nominal packet rate, shown as **Nominal** in the UI, used for the diagnostic/occupancy slot grids and the DSP grid. Without it `metadata.nominal_pps` is `null`, the UI shows the default nominal rate (20 PPS), and the DSP grid uses the measured rate |
+| `--no-dsp` | Skip the precomputed DSP view to keep the payload small; the DSP toggle stays hidden |
+| `--dsp-interp M` | Resampling interpolation: `nearest`, `linear` or `cubic` (default: `cubic`) |
+| `--dsp-norm S` | Normalization applied on top of the resampling: `none`, `per-subcarrier`, `per-sample` or `min-max` (default: `none`) |
+| `--dsp-max-gap-ms MS` | Mask grid columns whose source gap exceeds `MS` milliseconds (default: no threshold, every gap bridged) |
 | `--serve` | Start embedded asynchronous web server |
 | `--port PORT` | Port for the web server (default: `8080`) |
 | `--open` | Open generated HTML file or web server URL in default system browser |
@@ -338,5 +443,6 @@ cargo run --bin streaming -- --ip 10.178.22.9 --output capture_v8.bin --pps 100 
 ```
 
 Metadata field `nominal_pps` is the slot count used by the occupancy readout.
-The streaming module sets it to the configured `--pps`; file-based visualization
-defaults it to the measured `effective_pps`.
+The streaming module sets it to the configured `--pps`; a capture decoded
+without `--pps` leaves it `null` and the UI shows the default nominal rate
+(20 PPS) next to the measured `effective_pps`.

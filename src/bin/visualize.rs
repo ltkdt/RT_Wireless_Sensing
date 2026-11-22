@@ -11,7 +11,10 @@
 
 use std::{env, path::PathBuf, process::ExitCode};
 
-use rt_wireless_sensing::visualization::{VisualizationData, serve_dashboard};
+use rt_wireless_sensing::dsp::{InterpMethod, NormScheme};
+use rt_wireless_sensing::visualization::{
+    DspOptions, VisualizationData, VisualizationOptions, serve_dashboard,
+};
 
 /// Printed for `--help` and bad arguments.
 const USAGE: &str = "\
@@ -30,6 +33,14 @@ options:
   --pps PPS          nominal packet rate used for the diagnostic slot grid
                      (default: measured effective rate, which shrinks the grid
                      exactly for the seconds that miss samples)
+  --no-dsp           skip the precomputed DSP view (resampled amplitude/phase)
+                     to keep the payload small; the DSP toggle stays hidden
+  --dsp-interp M     resampling interpolation: nearest | linear | cubic
+                     (default: cubic)
+  --dsp-norm S       normalization on top of the resampling: none |
+                     per-subcarrier | per-sample | min-max (default: none)
+  --dsp-max-gap-ms MS  mask grid columns whose source gap exceeds MS
+                     milliseconds (default: no threshold, every gap bridged)
   --serve            start an embedded asynchronous web server
   --port PORT        port for the web server (default: 8080)
   --open             open the generated HTML or web server in default browser
@@ -44,6 +55,7 @@ struct Options {
     output: Option<PathBuf>,
     json_output: Option<PathBuf>,
     pps: Option<f64>,
+    dsp: Option<DspOptions>,
     serve: bool,
     port: u16,
     open: bool,
@@ -72,7 +84,29 @@ async fn main() -> ExitCode {
         }
     };
 
-    let data = match VisualizationData::from_file_with_pps(&options.input, options.pps) {
+    let bytes = match std::fs::read(&options.input) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!(
+                "error: failed to read '{}': {err}",
+                options.input.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let source_name = options.input.file_name().and_then(|name| name.to_str());
+    // DSP parameters are fixed here, once: the result is embedded in the
+    // payload, so the standalone HTML and `--serve` show identical data.
+    let data = match VisualizationData::from_bytes_with_options(
+        &bytes,
+        source_name,
+        VisualizationOptions {
+            nominal_pps: options.pps,
+            capture_end: true,
+            diagnostics: true,
+            dsp: options.dsp,
+        },
+    ) {
         Ok(data) => data,
         Err(err) => {
             eprintln!(
@@ -154,6 +188,7 @@ where
     let mut output = None;
     let mut json_output = None;
     let mut pps = None;
+    let mut dsp = Some(DspOptions::default());
     let mut serve = false;
     let mut port = 8080;
     let mut open = false;
@@ -186,6 +221,53 @@ where
                 }
                 pps = Some(parsed);
             }
+            "--no-dsp" => dsp = None,
+            "--dsp-interp" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--dsp-interp requires a method".to_string())?;
+                let interp = match val.as_str() {
+                    "nearest" | "nearest-neighbor" | "nearest_neighbour" => InterpMethod::Nearest,
+                    "linear" => InterpMethod::Linear,
+                    "cubic" | "cubic_spline" | "cubic-spline" => InterpMethod::CubicSpline,
+                    other => return Err(format!("invalid --dsp-interp: {other}")),
+                };
+                dsp = Some(DspOptions {
+                    interp,
+                    ..dsp.unwrap_or_default()
+                });
+            }
+            "--dsp-norm" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--dsp-norm requires a scheme".to_string())?;
+                let norm = match val.as_str() {
+                    "none" => None,
+                    "per-subcarrier" | "per_subcarrier" => Some(NormScheme::PerSubcarrier),
+                    "per-sample" | "per_sample" => Some(NormScheme::PerSample),
+                    "min-max" | "min_max" | "minmax" => Some(NormScheme::MinMax),
+                    other => return Err(format!("invalid --dsp-norm: {other}")),
+                };
+                dsp = Some(DspOptions {
+                    norm,
+                    ..dsp.unwrap_or_default()
+                });
+            }
+            "--dsp-max-gap-ms" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--dsp-max-gap-ms requires a number".to_string())?;
+                let parsed = val
+                    .parse::<f64>()
+                    .map_err(|_| format!("invalid --dsp-max-gap-ms: {val}"))?;
+                if !parsed.is_finite() || parsed < 0.0 {
+                    return Err(format!("invalid --dsp-max-gap-ms: {val}"));
+                }
+                dsp = Some(DspOptions {
+                    max_gap_ms: Some(parsed),
+                    ..dsp.unwrap_or_default()
+                });
+            }
             "--serve" => serve = true,
             "--port" => {
                 let val = args
@@ -214,6 +296,7 @@ where
         output,
         json_output,
         pps,
+        dsp,
         serve,
         port,
         open,
@@ -232,6 +315,10 @@ fn print_summary(data: &VisualizationData) {
     println!("start clock  : {} µs", m.start_time_us);
     println!("duration     : {:.3} s", m.duration_seconds);
     println!("rate         : {:.2} frames/s", m.effective_pps);
+    match m.nominal_pps {
+        Some(pps) => println!("nominal pps  : {:.0}", pps),
+        None => println!("nominal pps  : <not requested>"),
+    }
     if let Some(ch) = m.channel {
         println!("channel      : {}", ch);
     }
@@ -292,5 +379,81 @@ mod tests {
         assert!(parse(&["--invalid"]).is_err());
         assert!(parse(&["--output"]).is_err());
         assert!(parse(&["--port", "not_a_num"]).is_err());
+    }
+
+    #[test]
+    fn dsp_view_is_on_by_default() {
+        let ParsedArgs::Run(options) = parse(&["run.bin"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(options.dsp, Some(DspOptions::default()));
+    }
+
+    #[test]
+    fn no_dsp_turns_the_block_off() {
+        let ParsedArgs::Run(options) = parse(&["run.bin", "--no-dsp"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(options.dsp, None);
+    }
+
+    #[test]
+    fn dsp_flags_are_parsed_independently() {
+        let ParsedArgs::Run(options) = parse(&[
+            "run.bin",
+            "--dsp-interp",
+            "linear",
+            "--dsp-norm",
+            "min-max",
+            "--dsp-max-gap-ms",
+            "250",
+        ])
+        .unwrap() else {
+            panic!("expected a run");
+        };
+        let dsp = options.dsp.unwrap();
+        assert_eq!(dsp.interp, InterpMethod::Linear);
+        assert_eq!(dsp.norm, Some(NormScheme::MinMax));
+        assert_eq!(dsp.max_gap_ms, Some(250.0));
+
+        // Omitting a flag keeps its default, it does not clear the others.
+        let ParsedArgs::Run(options) = parse(&["run.bin", "--dsp-norm", "per-sample"]).unwrap()
+        else {
+            panic!("expected a run");
+        };
+        let dsp = options.dsp.unwrap();
+        assert_eq!(dsp.interp, InterpMethod::CubicSpline);
+        assert_eq!(dsp.norm, Some(NormScheme::PerSample));
+        assert_eq!(dsp.max_gap_ms, None);
+    }
+
+    #[test]
+    fn dsp_accepts_spelling_variants() {
+        for (arg, expected) in [
+            ("cubic", InterpMethod::CubicSpline),
+            ("cubic_spline", InterpMethod::CubicSpline),
+            ("nearest", InterpMethod::Nearest),
+            ("linear", InterpMethod::Linear),
+        ] {
+            let ParsedArgs::Run(options) = parse(&["run.bin", "--dsp-interp", arg]).unwrap() else {
+                panic!("expected a run");
+            };
+            assert_eq!(options.dsp.unwrap().interp, expected);
+        }
+        let ParsedArgs::Run(options) =
+            parse(&["run.bin", "--dsp-norm", "none"]).unwrap()
+        else {
+            panic!("expected a run");
+        };
+        assert_eq!(options.dsp.unwrap().norm, None);
+    }
+
+    #[test]
+    fn rejects_bad_dsp_values() {
+        assert!(parse(&["run.bin", "--dsp-interp"]).is_err());
+        assert!(parse(&["run.bin", "--dsp-interp", "spline"]).is_err());
+        assert!(parse(&["run.bin", "--dsp-norm", "zscore"]).is_err());
+        assert!(parse(&["run.bin", "--dsp-max-gap-ms", "-5"]).is_err());
+        assert!(parse(&["run.bin", "--dsp-max-gap-ms", "soon"]).is_err());
     }
 }

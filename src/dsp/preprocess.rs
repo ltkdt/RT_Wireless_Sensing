@@ -66,10 +66,19 @@ impl CsiSignal {
     /// ```
     pub fn normalize(&self, scheme: NormScheme) -> Self {
         let (n, sc) = self.amplitude.dim();
+        // Null subcarriers carry no channel information: they are excluded from
+        // the statistics behind every scheme and written back as 0. With an
+        // empty `null_bins` the code below is a plain whole-matrix pass, so the
+        // output is bit-identical to the null-unaware behaviour.
+        let null = &self.null_bins;
+        let is_null = |k: usize| null.contains(&k);
         let out = match scheme {
             NormScheme::PerSubcarrier => {
                 let mut out = Array2::<f64>::zeros((n, sc));
                 for k in 0..sc {
+                    if is_null(k) {
+                        continue;
+                    }
                     let col = self.amplitude.column(k);
                     let mean = col.sum() / n as f64;
                     let var =
@@ -81,16 +90,31 @@ impl CsiSignal {
                 out
             }
             NormScheme::PerSample => {
-                let total = (n * sc) as f64;
-                let mean = self.amplitude.sum() / total;
-                let var =
-                    self.amplitude.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / total;
-                let denom = var.sqrt() + EPS;
-                self.amplitude.mapv(|v| (v - mean) / denom)
+                let (sum, count) = self.accumulate_non_null(null, |v| v);
+                let mean = if count == 0 { 0.0 } else { sum / count as f64 };
+                let (squares, _) = self.accumulate_non_null(null, |v| (v - mean).powi(2));
+                let denom = if count == 0 {
+                    EPS
+                } else {
+                    (squares / count as f64).sqrt() + EPS
+                };
+                let mut out = Array2::<f64>::zeros((n, sc));
+                for k in 0..sc {
+                    if is_null(k) {
+                        continue;
+                    }
+                    out.column_mut(k).assign(
+                        &self.amplitude.column(k).mapv(|v| (v - mean) / denom),
+                    );
+                }
+                out
             }
             NormScheme::MinMax => {
                 let mut out = Array2::<f64>::zeros((n, sc));
                 for k in 0..sc {
+                    if is_null(k) {
+                        continue;
+                    }
                     let col = self.amplitude.column(k);
                     let min = col.iter().copied().fold(f64::INFINITY, f64::min);
                     let max = col.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -101,6 +125,29 @@ impl CsiSignal {
             }
         };
         self.with_amplitude(out)
+    }
+
+    /// Sum `f(value)` and count the samples over non-null subcarriers, in row
+    /// order. Order matches [`ndarray::Array2::iter`], so the accumulation is
+    /// the same one a whole-matrix pass would perform.
+    fn accumulate_non_null(
+        &self,
+        null: &[usize],
+        f: impl Fn(f64) -> f64,
+    ) -> (f64, usize) {
+        let (n, sc) = self.amplitude.dim();
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for i in 0..n {
+            for k in 0..sc {
+                if null.contains(&k) {
+                    continue;
+                }
+                sum += f(self.amplitude[[i, k]]);
+                count += 1;
+            }
+        }
+        (sum, count)
     }
 }
 
@@ -156,6 +203,7 @@ pub fn csi_ratio(signal: &CsiSignal) -> CsiSignal {
         ticks_us: signal.ticks_us.clone(),
         fs: signal.fs,
         iq: Some(out),
+        null_bins: signal.null_bins.clone(),
     };
     // n >= 1 always holds for a constructed CsiSignal; keep ticks valid.
     result.ticks_us = signal.ticks_us.clone();
@@ -224,6 +272,137 @@ mod tests {
         assert_eq!(z.ticks_us, signal.ticks_us);
         assert_eq!(z.fs, signal.fs);
         assert_eq!(z.phase, signal.phase);
+    }
+
+    /// A column of large values plus a null bin full of garbage: the null bin
+    /// must not pull any statistic.
+    fn signal_with_null_bin() -> CsiSignal {
+        let mut signal = signal_with_columns(vec![
+            vec![1.0, 2.0, 3.0, 4.0],       // subcarrier 0 (kept)
+            vec![1000.0, -500.0, 0.0, 250.0], // subcarrier 1 (null)
+            vec![5.0, 6.0, 7.0, 8.0],       // subcarrier 2 (kept)
+        ]);
+        signal.null_bins = vec![1];
+        signal
+    }
+
+    #[test]
+    fn null_bins_are_written_as_zero_for_every_scheme() {
+        let signal = signal_with_null_bin();
+        for scheme in [
+            NormScheme::PerSubcarrier,
+            NormScheme::PerSample,
+            NormScheme::MinMax,
+        ] {
+            let z = signal.normalize(scheme);
+            assert!(
+                z.amplitude.column(1).iter().all(|&v| v == 0.0),
+                "{scheme:?} must write the null column as zeros"
+            );
+            assert!(z.amplitude.iter().all(|v| v.is_finite()));
+        }
+    }
+
+    #[test]
+    fn per_sample_ignores_null_columns_in_mean_and_std() {
+        let signal = signal_with_null_bin();
+        let z = signal.normalize(NormScheme::PerSample);
+        // Hand-computed over subcarriers 0 and 2 only: values 1..4 and 5..8.
+        let kept = [1.0, 5.0, 2.0, 6.0, 3.0, 7.0, 4.0, 8.0];
+        let mean = kept.iter().sum::<f64>() / kept.len() as f64;
+        let std = (kept.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / kept.len() as f64)
+            .sqrt();
+        for (i, k) in [(0, 0), (1, 0), (2, 2), (3, 2)] {
+            let expected = (signal.amplitude[[i, k]] - mean) / (std + super::EPS);
+            assert!((z.amplitude[[i, k]] - expected).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn per_subcarrier_ignores_other_null_columns() {
+        let with_null = signal_with_null_bin();
+        let mut without = with_null.clone();
+        // Corrupt the null column further: a kept column's statistics must not
+        // move, because null columns are excluded outright.
+        for i in 0..4 {
+            without.amplitude[[i, 1]] *= 37.0;
+        }
+        let a = with_null.normalize(NormScheme::PerSubcarrier);
+        let b = without.normalize(NormScheme::PerSubcarrier);
+        for i in 0..4 {
+            for k in [0, 2] {
+                assert!((a.amplitude[[i, k]] - b.amplitude[[i, k]]).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_is_unchanged_when_null_bins_is_empty() {
+        let signal = signal_with_columns(vec![
+            vec![1.0, 2.0, 3.0, 4.0, 10.0],
+            vec![0.0, 0.0, 0.0, 0.0, 0.0],
+            vec![-3.0, 7.0, 2.0, 2.0, 1.0],
+        ]);
+        assert!(signal.null_bins.is_empty());
+        for scheme in [
+            NormScheme::PerSubcarrier,
+            NormScheme::PerSample,
+            NormScheme::MinMax,
+        ] {
+            // Reference implementation of the null-unaware formulas.
+            let (n, sc) = signal.amplitude.dim();
+            let mut expected = ndarray::Array2::<f64>::zeros((n, sc));
+            match scheme {
+                NormScheme::PerSubcarrier | NormScheme::MinMax => {
+                    for k in 0..sc {
+                        let col = signal.amplitude.column(k);
+                        if scheme == NormScheme::PerSubcarrier {
+                            let mean = col.sum() / n as f64;
+                            let var = col.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+                                / n as f64;
+                            let denom = var.sqrt() + super::EPS;
+                            expected.column_mut(k).assign(&col.mapv(|v| (v - mean) / denom));
+                        } else {
+                            let min = col.iter().copied().fold(f64::INFINITY, f64::min);
+                            let max = col.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                            let denom = max - min + super::EPS;
+                            expected
+                                .column_mut(k)
+                                .assign(&col.mapv(|v| (v - min) / denom));
+                        }
+                    }
+                }
+                NormScheme::PerSample => {
+                    let total = (n * sc) as f64;
+                    let mean = signal.amplitude.sum() / total;
+                    let var = signal
+                        .amplitude
+                        .iter()
+                        .map(|v| (v - mean).powi(2))
+                        .sum::<f64>()
+                        / total;
+                    let denom = var.sqrt() + super::EPS;
+                    expected = signal.amplitude.mapv(|v| (v - mean) / denom);
+                }
+            }
+            let got = signal.normalize(scheme);
+            for i in 0..n {
+                for k in 0..sc {
+                    assert!(
+                        (got.amplitude[[i, k]] - expected[[i, k]]).abs() < 1e-12,
+                        "{scheme:?} differs at ({i}, {k})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_keeps_null_bins_on_the_result() {
+        let signal = signal_with_null_bin();
+        let z = signal.normalize(NormScheme::PerSubcarrier);
+        assert_eq!(z.null_bins, vec![1]);
+        assert_eq!(csi_ratio(&signal).null_bins, vec![1]);
     }
 
     #[test]

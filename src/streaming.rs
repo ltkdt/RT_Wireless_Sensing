@@ -485,6 +485,9 @@ impl LiveAccumulator {
                 nominal_pps: Some(self.nominal_pps),
                 capture_end: false,
                 diagnostics: self.diagnostics,
+                // DSP is never computed while streaming: the analysis only
+                // exists once the capture is closed.
+                dsp: None,
             },
         )?;
 

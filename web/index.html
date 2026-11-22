@@ -38,9 +38,16 @@
                 <div class="metric-sub" id="metaSubcarriers">64 subcarriers / frame</div>
             </div>
             <div class="metric-card">
-                <div class="metric-label">Effective Rate</div>
-                <div class="metric-value" id="metaRate">--</div>
-                <div class="metric-sub">Packets per second</div>
+                <div class="metric-label">Packet Rate</div>
+                <div class="metric-pair">
+                    <span class="metric-pair-label">Nominal</span>
+                    <span class="metric-pair-value" id="metaNominalRate">--</span>
+                </div>
+                <div class="metric-pair">
+                    <span class="metric-pair-label">Effective</span>
+                    <span class="metric-pair-value metric-pair-strong" id="metaRate">--</span>
+                </div>
+                <div class="metric-sub" id="metaNominalRateHint">Requested PPS vs measured rate</div>
             </div>
             <div class="metric-card classification-card">
                 <div class="metric-label">Predicted Activity / Gesture</div>
@@ -87,17 +94,137 @@
                     <span id="loadingText">Decoding CSI stream...</span>
                 </div>
                 <canvas id="heatmapCanvas" width="1200" height="520"></canvas>
-                <div class="heatmap-tooltip" id="heatmapTooltip"></div>
+                <div class="heatmap-tooltip slot-tooltip" id="heatmapTooltip"></div>
             </div>
         </main>
 
-        <!-- Diagnostic View toggle (bottom; only offered when the payload has a `diagnostics` field) -->
-        <div class="diagnostic-toggle-bar" id="diagnosticToggleBar" hidden>
-            <label class="diagnostic-toggle" title="Per-second slot grid for PPS-deficit diagnosis">
-                <input type="checkbox" id="diagnosticToggle">
-                <span>Diagnostic view — per-second slot grid (PPS-deficit analysis)</span>
-            </label>
+        <!-- View toggles (bottom; each only offered when the payload carries its field).
+             One shared bar, diagnostic view first, DSP view second. -->
+        <div class="view-toggle-bar">
+            <div class="diagnostic-toggle-bar" id="diagnosticToggleBar" hidden>
+                <label class="diagnostic-toggle" title="Per-second slot grid for PPS-deficit diagnosis">
+                    <input type="checkbox" id="diagnosticToggle">
+                    <span>Diagnostic view — per-second slot grid (PPS-deficit analysis)</span>
+                </label>
+            </div>
+            <div class="diagnostic-toggle-bar" id="dspToggleBar" hidden>
+                <label class="diagnostic-toggle" title="Resampled and normalized panels computed by the Rust dsp module">
+                    <input type="checkbox" id="dspToggle">
+                    <span>DSP view — resampled amplitude / phase (uniform grid)</span>
+                </label>
+            </div>
         </div>
+        <div class="dsp-live-note" id="dspLiveNote" hidden>
+            DSP analysis is available after streaming is closed.
+        </div>
+
+        <!-- DSP View (placeholder values in this phase; separate canvases) -->
+        <section class="diagnostic-card" id="dspSection" hidden>
+            <div class="diagnostic-header">
+                <h2>DSP view</h2>
+                <span class="diagnostic-hint" id="dspHint">Resampled onto a uniform grid at the intended PPS.</span>
+            </div>
+
+            <!-- These parameters are fixed when the payload is prepared (Rust);
+                 the controls show what was actually computed and are disabled. -->
+            <div class="dsp-controls">
+                <div class="control-item">
+                    <label for="dspInterpSelect">Interpolation:</label>
+                    <select id="dspInterpSelect">
+                        <option value="cubic_spline" selected>Cubic spline</option>
+                        <option value="linear">Linear</option>
+                        <option value="nearest">Nearest</option>
+                    </select>
+                </div>
+                <div class="control-item">
+                    <label for="dspNormSelect">Normalization:</label>
+                    <select id="dspNormSelect">
+                        <option value="none" selected>None (resampled only)</option>
+                        <option value="per_subcarrier">Per subcarrier</option>
+                        <option value="per_sample">Per sample</option>
+                        <option value="min_max">Min–max</option>
+                    </select>
+                </div>
+                <div class="control-item">
+                    <label for="dspGapInput">Max gap (ms):</label>
+                    <input type="number" id="dspGapInput" min="0" step="1" placeholder="no limit">
+                </div>
+                <div class="control-item">
+                    <label>
+                        <input type="checkbox" id="dspHideNull"> Hide null subcarriers
+                    </label>
+                </div>
+            </div>
+
+            <div class="dsp-null-note" id="dspNullNote" hidden></div>
+
+            <!-- Time-window selector: one per canvas, canvas-only restriction. -->
+            <div class="dsp-window" id="dspWindowControls">
+                <label for="dspWindowStart">Window start (s):</label>
+                <input type="range" id="dspWindowStart" min="0" max="0" step="0.1" value="0">
+                <span class="dsp-window-value" id="dspWindowReadout">0.0 s</span>
+                <label for="dspWindowLength">Length (s):</label>
+                <select id="dspWindowLength">
+                    <option value="10">10</option>
+                    <option value="30" selected>30</option>
+                    <option value="60">60</option>
+                    <option value="120">120</option>
+                    <option value="300">300 (max visible)</option>
+                </select>
+                <span class="dsp-window-note">canvas window only — the recording and CSV keep everything</span>
+            </div>
+
+            <!-- Mask strip: observed / bridged / masked per grid column. -->
+            <div class="dsp-mask-row">
+                <span class="dsp-mask-label">grid state</span>
+                <canvas id="dspMaskCanvas" width="1200" height="18"></canvas>
+            </div>
+
+            <div class="slot-legend" id="dspMaskLegend">
+                <span class="legend-item"><span class="legend-swatch dsp-state-observed"></span>observed</span>
+                <span class="legend-item"><span class="legend-swatch dsp-state-bridged"></span>bridged (interpolated across a gap)</span>
+                <span class="legend-item"><span class="legend-swatch dsp-state-masked"></span>masked (gap over the limit)</span>
+                <span class="legend-item"><span class="legend-swatch legend-empty"></span>null subcarrier</span>
+            </div>
+
+            <div class="dsp-panel" id="dspAmplitudePanel">
+                <div class="dsp-panel-head">
+                    <h3>Amplitude — resampled</h3>
+                    <span class="dsp-panel-meta" id="dspAmplitudeMeta"></span>
+                    <button class="dsp-csv-btn" id="dspAmplitudeCsv" title="Export the full recording as CSV">Export CSV</button>
+                </div>
+                <div class="dsp-canvas-wrapper">
+                    <canvas id="dspAmplitudeCanvas" width="1200" height="300"></canvas>
+                    <div class="slot-tooltip" id="dspAmplitudeTooltip"></div>
+                </div>
+            </div>
+
+            <div class="dsp-panel" id="dspPhasePanel">
+                <div class="dsp-panel-head">
+                    <h3>Phase — resampled</h3>
+                    <span class="dsp-panel-meta" id="dspPhaseMeta"></span>
+                    <button class="dsp-csv-btn" id="dspPhaseCsv" title="Export the full recording as CSV">Export CSV</button>
+                </div>
+                <div class="dsp-canvas-wrapper">
+                    <canvas id="dspPhaseCanvas" width="1200" height="300"></canvas>
+                    <div class="slot-tooltip" id="dspPhaseTooltip"></div>
+                </div>
+            </div>
+
+            <div class="dsp-panel" id="dspNormPanel" hidden>
+                <div class="dsp-panel-head">
+                    <h3>Amplitude — normalized</h3>
+                    <span class="dsp-panel-meta" id="dspNormMeta"></span>
+                    <button class="dsp-csv-btn" id="dspNormCsv" title="Export the full recording as CSV">Export CSV</button>
+                </div>
+                <div class="dsp-canvas-wrapper">
+                    <canvas id="dspNormCanvas" width="1200" height="300"></canvas>
+                    <div class="slot-tooltip" id="dspNormTooltip"></div>
+                </div>
+            </div>
+
+            <div class="diag-note" id="dspPlaceholderNote"></div>
+        </section>
 
         <!-- Diagnostic View (separate canvas, heatmap untouched when off) -->
         <section class="diagnostic-card" id="diagnosticSection" hidden>

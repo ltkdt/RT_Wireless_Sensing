@@ -130,6 +130,36 @@ body {
     font-size: 0.75rem;
     color: var(--text-muted);
 }
+/* Two-line readout inside a metric card: label on the left, value on the right. */
+.metric-pair {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+}
+.metric-pair-label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    font-weight: 600;
+}
+.metric-pair-value {
+    font-size: 1.1rem;
+    font-variant-numeric: tabular-nums;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    color: var(--text-secondary);
+}
+.metric-pair-value.metric-pair-strong {
+    font-size: 1.35rem;
+    color: var(--text-primary);
+}
+/* Nominal PPS that came from the UI default, not from a --pps argument. */
+.metric-pair-value.metric-pair-default {
+    color: var(--text-secondary);
+    font-style: italic;
+}
 
 /* Classification Card */
 .metric-card.classification-card {
@@ -285,12 +315,13 @@ button:active {
 .heatmap-tooltip {
     position: absolute;
     pointer-events: none;
-    background: rgba(15, 23, 42, 0.95);
-    border: 1px solid var(--accent-blue);
+    background: rgba(15, 23, 42, 0.96);
+    border: 1px solid var(--accent-amber);
     border-radius: 6px;
     padding: 6px 10px;
     font-family: var(--font-mono);
-    font-size: 0.75rem;
+    font-size: 0.72rem;
+    line-height: 1.5;
     color: var(--text-primary);
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
     z-index: 20;
@@ -298,30 +329,69 @@ button:active {
     white-space: nowrap;
 }
 
-/* Diagnostic View (Phase 1: placeholder values) */
+.heatmap-tooltip .tip-title,
+.heatmap-tooltip strong {
+    font-weight: 700;
+    color: var(--accent-amber);
+}
+
+/* Diagnostic View / DSP View */
+.view-toggle-bar {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 6px;
+    padding: 6px 2px;
+}
+
 .diagnostic-toggle-bar {
     display: flex;
     justify-content: flex-end;
-    padding: 4px 2px;
+    padding: 0;
 }
 
 .diagnostic-toggle {
     display: inline-flex;
     align-items: center;
-    gap: 8px;
-    font-size: 0.8rem;
+    gap: 12px;
+    padding: 10px 16px;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background-color: var(--bg-card);
+    font-size: 1rem;
+    line-height: 1.4;
     color: var(--text-secondary);
     cursor: pointer;
     user-select: none;
+    transition: border-color 0.15s ease, color 0.15s ease;
 }
 
 .diagnostic-toggle input {
+    width: 20px;
+    height: 20px;
+    margin: 0;
     accent-color: var(--accent-amber);
     cursor: pointer;
 }
 
 .diagnostic-toggle:hover {
     color: var(--text-primary);
+    border-color: var(--accent-amber);
+}
+
+.diagnostic-toggle:has(input:checked) {
+    color: var(--text-primary);
+    border-color: var(--accent-amber);
+}
+
+/* Documents flow order inside `.dashboard-container`: the DSP section always
+   sits below the diagnostic one, whatever order the toggles are switched on. */
+#diagnosticSection {
+    order: 2;
+}
+
+#dspSection {
+    order: 3;
 }
 
 .diagnostic-card {
@@ -387,7 +457,8 @@ button:active {
     white-space: nowrap;
 }
 
-.slot-tooltip .tip-title {
+.slot-tooltip .tip-title,
+.slot-tooltip strong {
     font-weight: 700;
     color: var(--accent-amber);
 }
@@ -707,4 +778,198 @@ button:active {
 
 .diag-tooltip .tip-body {
     color: var(--text-secondary);
+}
+
+/* --- DSP view (resample + normalize panels; phase 1 is UI-only) --- */
+
+.dsp-live-note {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    background-color: rgba(15, 23, 42, 0.6);
+    border: 1px dashed var(--border-color);
+    border-radius: 8px;
+    padding: 10px 14px;
+}
+
+.dsp-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 16px;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.dsp-controls .control-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+/* The DSP parameters are baked into the payload: the controls report what was
+   computed and cannot re-run it, so they read as read-only. */
+.dsp-controls select:disabled,
+.dsp-controls input:disabled {
+    opacity: 0.75;
+    cursor: not-allowed;
+    background-color: var(--bg-card-hover);
+    color: var(--text-primary);
+}
+
+.dsp-controls select,
+.dsp-controls input[type="number"] {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    background-color: #0b1120;
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 5px;
+    padding: 3px 6px;
+}
+
+.dsp-controls input[type="number"] {
+    width: 90px;
+}
+
+.dsp-null-note {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    border-left: 2px solid var(--accent-purple);
+    padding-left: 8px;
+}
+
+/* Window selector: canvas-only restriction, never truncates the recording. */
+.dsp-window {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--text-secondary);
+    background-color: rgba(2, 6, 23, 0.45);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 8px 12px;
+}
+
+.dsp-window input[type="range"] {
+    flex: 1 1 220px;
+    min-width: 140px;
+}
+
+.dsp-window select {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    background-color: #0b1120;
+    color: var(--text-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 5px;
+    padding: 2px 5px;
+}
+
+.dsp-window-value {
+    color: var(--text-primary);
+    font-weight: 600;
+    min-width: 92px;
+}
+
+.dsp-window-note {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+.dsp-mask-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.dsp-mask-label {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    flex: 0 0 70px;
+}
+
+#dspMaskCanvas {
+    display: block;
+    flex: 1;
+    width: 100%;
+    height: 18px;
+    border-radius: 3px;
+    border: 1px solid #1e293b;
+}
+
+.legend-swatch.dsp-state-observed { background: #22c55e; }
+.legend-swatch.dsp-state-bridged { background: #fbbf24; }
+.legend-swatch.dsp-state-masked { background: #64748b; }
+
+.dsp-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.dsp-panel-head {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.dsp-panel-head h3 {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin: 0;
+}
+
+.dsp-panel-meta {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    flex: 1;
+}
+
+.dsp-csv-btn {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    background-color: transparent;
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 5px;
+    padding: 3px 9px;
+    cursor: pointer;
+}
+
+.dsp-csv-btn:hover {
+    color: var(--accent-amber);
+    border-color: var(--accent-amber);
+}
+
+.dsp-canvas-wrapper {
+    position: relative;
+    width: 100%;
+    background-color: #0b1120;
+    border-radius: 8px;
+    border: 1px solid #1e293b;
+    overflow: hidden;
+}
+
+.dsp-canvas-wrapper canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    cursor: crosshair;
+}
+
+.dsp-canvas-wrapper .slot-tooltip {
+    white-space: normal;
+    max-width: 320px;
 }

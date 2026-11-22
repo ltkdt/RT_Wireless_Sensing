@@ -122,11 +122,36 @@ pub use filter::{
     bandpass, exp_moving_average, hampel_filter, highpass, lowpass, median_filter, moving_average,
 };
 pub use preprocess::{NormScheme, csi_ratio};
-pub use resample::InterpMethod;
+pub use resample::{GridState, InterpMethod, ResampleOptions, ResampleOutput};
 pub use spectral::{Spectrogram, Spectrum, StftConfig, Window, dominant_peaks, fft, freq_bins, stft};
 
 /// Epsilon guard against near-zero variance in normalization and min-max.
 pub(crate) const EPS: f64 = 1e-12;
+
+/// Count of [`NULL_BINS_HT20`], kept as a standalone constant for array sizing.
+const NULL_BINS_HT20_COUNT: usize = 8;
+
+/// Null (guard/pilot-nulling) subcarrier indices of a centred HT20 capture:
+/// the four lowest and four highest bins plus the DC bin, for 64 subcarriers.
+///
+/// These subcarriers carry no useful channel information — the ESP32 reports
+/// them with zero (or near-zero) amplitude — so they must never be rendered as
+/// real `0` values and must be excluded from any transform that works across
+/// the subcarrier axis.
+pub const NULL_BINS_HT20: [usize; NULL_BINS_HT20_COUNT] = [0, 1, 2, 3, 32, 61, 62, 63];
+
+/// Number of subcarriers of the HT20 layout [`NULL_BINS_HT20`] describes.
+pub const HT20_SUBCARRIERS: usize = 64;
+
+/// Null bins of the HT20 layout, or an empty list for any other subcarrier
+/// count (a non-HT20 capture has no known null-bin table here).
+pub fn null_bins_for(subcarriers: usize) -> Vec<usize> {
+    if subcarriers == HT20_SUBCARRIERS {
+        NULL_BINS_HT20.to_vec()
+    } else {
+        Vec::new()
+    }
+}
 
 /// A decoded CSI record set ready for signal processing.
 ///
@@ -153,6 +178,14 @@ pub struct CsiSignal {
     /// signal was built from amplitude/phase only (then
     /// [`CsiSignal::complex`] reconstructs it).
     pub iq: Option<Array2<Complex<f64>>>,
+    /// Indices of the null (guard/DC) subcarriers, ascending. Empty by default;
+    /// [`CsiSignal::from_packets`] fills [`NULL_BINS_HT20`] for 64-subcarrier
+    /// captures.
+    ///
+    /// Null subcarriers carry no channel information: they are never rendered
+    /// as a real value and are excluded from every transform that works across
+    /// the subcarrier axis (see [`CsiSignal::normalize`]).
+    pub null_bins: Vec<usize>,
 }
 
 /// Failure modes of the dsp module.
@@ -310,6 +343,7 @@ impl CsiSignal {
             ticks_us,
             fs,
             iq: None,
+            null_bins: Vec::new(),
         })
     }
 
@@ -429,6 +463,9 @@ impl CsiSignal {
 
         let mut signal = Self::new(amplitude, phase, ticks_us)?;
         signal.iq = Some(iq);
+        // A 64-subcarrier capture is HT20: mark its guard/DC bins so that
+        // normalization and every cross-subcarrier transform skip them.
+        signal.null_bins = null_bins_for(subcarriers);
         Ok(signal)
     }
 
@@ -618,6 +655,7 @@ impl CsiSignal {
             ticks_us: self.ticks_us.clone(),
             fs: self.fs,
             iq: Some(iq),
+            null_bins: self.null_bins.clone(),
         }
     }
 

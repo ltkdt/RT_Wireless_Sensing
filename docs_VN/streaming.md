@@ -83,7 +83,9 @@ Kết quả xuất hiện trong hàng hover dưới dạng **Độ chiếm chỗ
 rời khỏi cửa sổ 30 giây.
 
 Số lượng khe đến từ `metadata.nominal_pps` (được đặt thành `--pps` bởi
-mô-đun này). Bản ghi tĩnh sử dụng PPS hiệu quả được đo.
+mô-đun này), đây là tốc độ được yêu cầu. Thẻ metadata hiển thị nó cạnh
+`metadata.effective_pps`, tốc độ thực tế đo được từ đồng hồ thiết bị; hai giá
+trị khác nhau khi thiết bị không theo kịp `--pps`.
 
 ## API thư viện
 
@@ -187,5 +189,10 @@ Trình duyệt thăm dò mỗi 500 ms với `Cache-Control: no-store`.
 - Mô-đun này ghi `.bin` thô, không phải `.npz`. Sử dụng [`saving`](saving.md) trên
   bản ghi sau đó nếu cần mảng số.
 - Yêu cầu ESP32 có thể truy cập chạy ESPectre, giống như `collect`.
+- Chế độ trực tiếp không bao giờ tính **DSP view**. Việc tái lấy mẫu, chia đoạn
+  theo khoảng trống và chuẩn hóa cần toàn bộ bản ghi (nội suy trên toàn bản ghi
+  tránh gấp khúc ở biên), nên DSP view chỉ tồn tại trong đường
+  [`visualization`](visualization.md) offline — payload của bảng điều khiển mang
+  `dsp: null` và panel DSP ẩn đi.
 - Chỉ `127.0.0.1` được ràng buộc; sử dụng SSH tunnel hoặc proxy đảo ngược để xem
   từ máy khác.

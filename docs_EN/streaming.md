@@ -86,7 +86,9 @@ recomputed when the live window refreshes and disappears once that second
 leaves the 30 s window.
 
 The slot count comes from `metadata.nominal_pps` (set to `--pps` by this
-module). Static captures fall back to the measured effective PPS.
+module), which is the requested rate. The metadata card shows it next to
+`metadata.effective_pps`, the rate actually measured from the device clock;
+the two differ whenever the device cannot keep up with `--pps`.
 
 ## Library API
 
@@ -190,5 +192,10 @@ The browser polls every 500 ms with `Cache-Control: no-store`.
 - This module writes a raw `.bin`, not a `.npz`. Use [`saving`](saving.md) on the
   capture afterwards if numeric arrays are needed.
 - Requires a reachable ESP32 running ESPectre, as with `collect`.
+- Live mode never computes the **DSP view**. Resampling, gap splitting and
+  normalization need the whole record (whole-record interpolation avoids
+  boundary kinks), so the DSP view only exists in the offline
+  [`visualization`](visualization.md) path — the dashboard payload carries
+  `dsp: null` and the DSP panel stays hidden.
 - Only `127.0.0.1` is bound; use an SSH tunnel or a reverse proxy to view it
   from another machine.

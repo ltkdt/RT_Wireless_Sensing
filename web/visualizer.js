@@ -33,6 +33,26 @@ const COLORMAPS = {
         [0.65, [255, 255, 0]],
         [0.85, [255, 0, 0]],
         [1.0,  [128, 0, 0]]
+    ],
+    // Cyclic map for phase (−π…π): both ends share a colour so a wrap is not
+    // read as a discontinuity. First and last stops are identical on purpose.
+    twilight: [
+        [0.0,  [226, 217, 226]],
+        [0.15, [160, 139, 187]],
+        [0.3,  [91, 96, 158]],
+        [0.45, [46, 60, 110]],
+        [0.55, [46, 60, 110]],
+        [0.65, [91, 96, 158]],
+        [0.8,  [160, 139, 187]],
+        [1.0,  [226, 217, 226]]
+    ],
+    // Diverging map used for a normalized amplitude that can go negative.
+    rdbu: [
+        [0.0,  [5, 48, 97]],
+        [0.25, [103, 169, 207]],
+        [0.5,  [247, 247, 247]],
+        [0.75, [239, 138, 98]],
+        [1.0,  [103, 0, 31]]
     ]
 };
 
@@ -69,13 +89,21 @@ function generateColormapLUT(stops) {
 const COLORMAP_LUTS = {
     viridis: generateColormapLUT(COLORMAPS.viridis),
     plasma: generateColormapLUT(COLORMAPS.plasma),
-    jet: generateColormapLUT(COLORMAPS.jet)
+    jet: generateColormapLUT(COLORMAPS.jet),
+    twilight: generateColormapLUT(COLORMAPS.twilight),
+    rdbu: generateColormapLUT(COLORMAPS.rdbu)
 };
 
 // Last-resort fallback only: Rust always sends metadata.subcarriers, and the
 // static label in index.html keeps "64 subcarriers / frame" as its fallback
 // text. All rendering paths must prefer metadata.subcarriers.
 const FALLBACK_SUBCARRIERS = 64;
+
+// Nominal PPS assumed when the payload carries no `--pps` argument
+// (`metadata.nominal_pps` is `null`/absent). Kept in sync with
+// `collection::DEFAULT_PPS` in Rust: the dashboard says it is a default rather
+// than presenting it as a measured value.
+const DEFAULT_NOMINAL_PPS = 20;
 
 // --- Heatmap Visualizer Class ---
 class CsiVisualizer {
@@ -90,6 +118,10 @@ class CsiVisualizer {
         this.hoverState = null;
         this.occupancy = null;
         this.diagnosticView = null;
+        this.dspView = null;
+        // Set by the bootstrap when the payload came from the live streaming
+        // branch; the DSP view uses it to show its "after streaming" note.
+        this.live = false;
         this.offscreenCanvas = document.createElement('canvas');
         this.offscreenCtx = this.offscreenCanvas.getContext('2d');
 
@@ -101,6 +133,10 @@ class CsiVisualizer {
             left: 75
         };
 
+        this.tooltip = document.getElementById('heatmapTooltip');
+        this.wrapper = this.canvas ? this.canvas.parentElement : null;
+        this.offscreenDirty = true;
+
         this.initEvents();
     }
 
@@ -109,10 +145,14 @@ class CsiVisualizer {
         this.calculateBounds();
         this.updateMetadataUI();
         this.refreshOccupancy();
+        this.offscreenDirty = true;
         this.render();
         if (this.diagnosticView) {
             this.diagnosticView.setData(data);
             this.diagnosticView.setSelection(this.occupancy);
+        }
+        if (this.dspView) {
+            this.dspView.setData(data, this.live);
         }
     }
 
@@ -138,14 +178,26 @@ class CsiVisualizer {
         this.maxAmp = max > min ? max : min + 1.0;
     }
 
-    // Nominal packets-per-second used to divide a one-second interval into
-    // occupancy slots. The streaming command sets this to --pps; static
-    // captures fall back to the measured effective rate.
-    getNominalPps() {
+    // Requested (nominal) packets-per-second, i.e. the `--pps` argument.
+    // Returns null when the payload carries no argument, so callers can show
+    // the fallback instead of pretending it was requested.
+    getRequestedPps() {
         const meta = this.data && this.data.metadata;
-        const configured = meta && Number.isFinite(meta.nominal_pps) ? meta.nominal_pps : 0;
-        const measured = meta && Number.isFinite(meta.effective_pps) ? meta.effective_pps : 0;
-        const pps = Math.round(configured > 0 ? configured : measured);
+        if (!meta) return null;
+        const configured = meta.nominal_pps;
+        if (typeof configured === 'number' && Number.isFinite(configured) && configured > 0) {
+            return configured;
+        }
+        return null;
+    }
+
+    // Nominal packets-per-second used to divide a one-second interval into
+    // occupancy slots: the `--pps` argument when present, otherwise the
+    // default rate. The measured rate is never used here — it is reported
+    // separately as effective PPS.
+    getNominalPps() {
+        const requested = this.getRequestedPps();
+        const pps = Math.round(requested !== null ? requested : DEFAULT_NOMINAL_PPS);
         return Math.max(1, Math.min(pps || 1, 100000));
     }
 
@@ -246,7 +298,29 @@ class CsiVisualizer {
         setElem('metaStartTime', meta.start_time_formatted || '0.000 s');
         setElem('metaDuration', `${meta.duration_seconds.toFixed(2)} s`);
         setElem('metaFrames', `${meta.total_frames.toLocaleString()} frames`);
-        setElem('metaRate', `${meta.effective_pps.toFixed(2)} PPS`);
+
+        // Packet rate: the requested `--pps` argument (nominal) next to the
+        // rate actually measured from the device clock (effective).
+        const requested = this.getRequestedPps();
+        const hasArgument = requested !== null;
+        const nominal = this.getNominalPps();
+        setElem('metaNominalRate', `${nominal} PPS`);
+        setElem(
+            'metaNominalRateHint',
+            hasArgument ? 'Requested --pps vs measured rate' : `No --pps argument — default ${nominal} PPS`
+        );
+        const nominalEl = document.getElementById('metaNominalRate');
+        if (nominalEl) {
+            nominalEl.classList.toggle('metric-pair-default', !hasArgument);
+            nominalEl.title = hasArgument
+                ? `--pps ${nominal} (slot grid rate)`
+                : `--pps not supplied; DEFAULT_NOMINAL_PPS = ${nominal} is used for the slot grid`;
+        }
+        setElem(
+            'metaRate',
+            Number.isFinite(meta.effective_pps) ? `${meta.effective_pps.toFixed(2)} PPS` : '--'
+        );
+
         setElem(
             'metaSubcarriers',
             `${Number.isFinite(meta.subcarriers) && meta.subcarriers > 0 ? meta.subcarriers : FALLBACK_SUBCARRIERS} subcarriers / frame`
@@ -311,7 +385,10 @@ class CsiVisualizer {
     render() {
         if (!this.data) return;
 
-        this.updateOffscreenBuffer();
+        if (this.offscreenDirty) {
+            this.updateOffscreenBuffer();
+            this.offscreenDirty = false;
+        }
 
         // Canvas sizing for Retina / High DPI displays
         const rect = this.canvas.getBoundingClientRect();
@@ -621,16 +698,27 @@ class CsiVisualizer {
         document.getElementById('hoverAmplitude').textContent = `${point.ampVal.toFixed(2)}`;
         document.getElementById('hoverFrame').textContent = `#${point.frameIdx}`;
 
-        const tooltip = document.getElementById('heatmapTooltip');
+        const tooltip = this.tooltip || document.getElementById('heatmapTooltip');
         if (tooltip) {
-            tooltip.style.display = 'block';
-            tooltip.style.left = `${point.clientX + 15}px`;
-            tooltip.style.top = `${point.clientY + 15}px`;
             tooltip.innerHTML = `
-                <div><strong>Time:</strong> ${point.timeSec.toFixed(3)} s (#${point.frameIdx})</div>
+                <div class="tip-title"><strong>Time:</strong> ${point.timeSec.toFixed(3)} s (#${point.frameIdx})</div>
                 <div><strong>Subcarrier:</strong> ${point.scIdx}</div>
                 <div><strong>Amplitude:</strong> ${point.ampVal.toFixed(3)} a.u.</div>
             `;
+            tooltip.style.display = 'block';
+
+            const wrap = this.wrapper || tooltip.parentElement;
+            if (wrap) {
+                const wrapRect = wrap.getBoundingClientRect();
+                let left = point.clientX - wrapRect.left + 15;
+                let top = point.clientY - wrapRect.top + 15;
+                const tw = tooltip.offsetWidth;
+                const th = tooltip.offsetHeight;
+                if (left + tw > wrapRect.width - 8) left = point.clientX - wrapRect.left - tw - 10;
+                if (top + th > wrapRect.height - 8) top = point.clientY - wrapRect.top - th - 10;
+                tooltip.style.left = `${Math.max(4, left)}px`;
+                tooltip.style.top = `${Math.max(4, top)}px`;
+            }
         }
     }
 
@@ -671,6 +759,7 @@ class CsiVisualizer {
         if (colormapSelect) {
             colormapSelect.addEventListener('change', (e) => {
                 this.colormap = e.target.value;
+                this.offscreenDirty = true;
                 this.render();
                 if (this.diagnosticView) this.diagnosticView.render();
             });
@@ -680,6 +769,7 @@ class CsiVisualizer {
         if (smoothingToggle) {
             smoothingToggle.addEventListener('change', (e) => {
                 this.smoothing = e.target.checked;
+                this.offscreenDirty = true;
                 this.render();
             });
         }
@@ -697,7 +787,7 @@ class CsiVisualizer {
 
     clearHover() {
         this.hoverState = null;
-        const tooltip = document.getElementById('heatmapTooltip');
+        const tooltip = this.tooltip || document.getElementById('heatmapTooltip');
         if (tooltip) tooltip.style.display = 'none';
 
         document.getElementById('hoverTime').textContent = '--';
@@ -1582,10 +1672,639 @@ class DiagnosticView {
     }
 }
 
+// --- DSP View ---
+//
+// Every value drawn here comes from the precomputed Rust `dsp` payload block:
+//
+//   dsp: { interp, target_fs, norm, max_gap_ms, timestamps,
+//          null_subcarriers, time_state, panels: [{ id, title, unit,
+//          kind, data }] }
+//
+// The browser never resamples or normalizes: Rust is the single implementation
+// of the formulas and this class only formats. Live (streaming) payloads carry
+// `dsp: null`, so the toggle is replaced by the "available after streaming is
+// closed" note.
+
+// Per-grid-column state, matching the planned `time_state` byte values.
+const GRID_STATE = { observed: 0, bridged: 1, masked: 2 };
+const GRID_STATE_COLORS = ['#22c55e', '#fbbf24', '#64748b'];
+
+// Maximum visible window per canvas (seconds). This bounds the canvas only —
+// the recording and its CSV export are never truncated.
+const DSP_MAX_WINDOW_S = 300;
+
+class DspView {
+    constructor(visualizer) {
+        this.visualizer = visualizer;
+        this.section = document.getElementById('dspSection');
+        this.toggleBar = document.getElementById('dspToggleBar');
+        this.toggle = document.getElementById('dspToggle');
+        this.liveNote = document.getElementById('dspLiveNote');
+        this.hint = document.getElementById('dspHint');
+        this.nullNote = document.getElementById('dspNullNote');
+        this.placeholderNote = document.getElementById('dspPlaceholderNote');
+        this.hideNullCheckbox = document.getElementById('dspHideNull');
+        this.interpSelect = document.getElementById('dspInterpSelect');
+        this.normSelect = document.getElementById('dspNormSelect');
+        this.gapInput = document.getElementById('dspGapInput');
+        this.windowStart = document.getElementById('dspWindowStart');
+        this.windowLength = document.getElementById('dspWindowLength');
+        this.windowReadout = document.getElementById('dspWindowReadout');
+        this.maskCanvas = document.getElementById('dspMaskCanvas');
+        this.panels = {
+
+            amplitude: {
+                wrapper: document.getElementById('dspAmplitudePanel'),
+                canvas: document.getElementById('dspAmplitudeCanvas'),
+                tooltip: document.getElementById('dspAmplitudeTooltip'),
+                meta: document.getElementById('dspAmplitudeMeta'),
+                csv: document.getElementById('dspAmplitudeCsv'),
+                lut: 'viridis',
+                kind: 'sequential'
+            },
+            phase: {
+                wrapper: document.getElementById('dspPhasePanel'),
+                canvas: document.getElementById('dspPhaseCanvas'),
+                tooltip: document.getElementById('dspPhaseTooltip'),
+                meta: document.getElementById('dspPhaseMeta'),
+                csv: document.getElementById('dspPhaseCsv'),
+                lut: 'twilight',
+                kind: 'cyclic'
+            },
+            amplitude_norm: {
+                wrapper: document.getElementById('dspNormPanel'),
+                canvas: document.getElementById('dspNormCanvas'),
+                tooltip: document.getElementById('dspNormTooltip'),
+                meta: document.getElementById('dspNormMeta'),
+                csv: document.getElementById('dspNormCsv'),
+                lut: 'rdbu',
+                kind: 'diverging'
+            }
+        };
+        this.data = null;
+        this.enabled = false;
+        this.live = false;
+        this.model = null;
+        this.offscreen = document.createElement('canvas');
+        this.offCtx = this.offscreen.getContext('2d');
+        this.margin = { top: 34, right: 118, bottom: 46, left: 62 };
+        this.initEvents();
+    }
+
+    initEvents() {
+        if (this.toggle) {
+            this.toggle.addEventListener('change', (e) => this.setEnabled(e.target.checked));
+        }
+        if (this.hideNullCheckbox) {
+            this.hideNullCheckbox.addEventListener('change', () => this.render());
+        }
+        for (const select of [this.interpSelect, this.normSelect, this.windowLength]) {
+            if (select) select.addEventListener('change', () => this.render());
+        }
+        if (this.gapInput) {
+            this.gapInput.addEventListener('input', () => this.render());
+        }
+        if (this.windowStart) {
+            this.windowStart.addEventListener('input', () => this.render());
+        }
+        for (const [id, panel] of Object.entries(this.panels)) {
+            if (panel.canvas) {
+                panel.canvas.addEventListener('mousemove', (e) => this.onMouseMove(e, id));
+                panel.canvas.addEventListener('mouseleave', () => this.hideTooltip(id));
+            }
+            if (panel.csv) {
+                panel.csv.addEventListener('click', () => this.exportCsv(id));
+            }
+        }
+        window.addEventListener('resize', () => this.render());
+    }
+
+    // `live` distinguishes the streaming branch: DSP is never computed there,
+    // so the toggle is replaced by the note.
+    setData(data, live) {
+        this.data = data;
+        this.live = !!live;
+        const dsp = (data && data.dsp) || null;
+        this.dsp = dsp;
+
+        if (this.toggleBar) this.toggleBar.hidden = !dsp;
+        if (this.liveNote) this.liveNote.hidden = !(this.live && !dsp);
+        if (!dsp) this.setEnabled(false);
+        this.syncControls(dsp);
+        this.render();
+    }
+
+    // The payload fixes the DSP parameters, so the selectors show what was
+    // actually computed instead of pretending to re-run it in the browser.
+    syncControls(dsp) {
+        if (!dsp) return;
+        if (this.interpSelect) {
+            this.interpSelect.value = dsp.interp || 'cubic_spline';
+            this.interpSelect.disabled = true;
+        }
+        if (this.normSelect) {
+            this.normSelect.value = dsp.norm || 'none';
+            this.normSelect.disabled = true;
+        }
+        if (this.gapInput) {
+            this.gapInput.value = dsp.max_gap_ms === null || dsp.max_gap_ms === undefined
+                ? ''
+                : String(dsp.max_gap_ms);
+            this.gapInput.disabled = true;
+        }
+        // The parameters are embedded in an immutable HTML bundle, so explain
+        // how to change them rather than leaving dead controls unexplained.
+        for (const el of [this.interpSelect, this.normSelect, this.gapInput]) {
+            if (el) el.title = 'Fixed when the payload was prepared — re-run visualize with --dsp-interp / --dsp-norm / --dsp-max-gap-ms to change it.';
+        }
+    }
+
+    setEnabled(on) {
+        this.enabled = on;
+        if (this.toggle) this.toggle.checked = on;
+        if (this.section) this.section.hidden = !on;
+        if (!on) {
+            for (const id of Object.keys(this.panels)) this.hideTooltip(id);
+        }
+        this.render();
+    }
+
+    // The model is the payload block itself; nothing is derived in the browser.
+    currentModel() {
+        return this.dsp || null;
+    }
+
+    render() {
+        if (!this.section) return;
+        if (!this.enabled) {
+            this.model = null;
+            return;
+        }
+
+        this.model = this.currentModel();
+        if (!this.model) return;
+
+        // Null-subcarrier note, always visible so the masking rule is explicit.
+        const hidden = this.hideNullCheckbox && this.hideNullCheckbox.checked;
+        if (this.nullNote) {
+            const bins = this.model.null_subcarriers;
+            this.nullNote.hidden = bins.length === 0;
+            this.nullNote.textContent = bins.length === 0
+                ? ''
+                : `${bins.length} null subcarrier(s) ${hidden ? 'hidden' : 'masked'}: bins ${bins.join(', ')} — `
+                    + 'never rendered as 0 and excluded from transforms across the subcarrier axis.';
+        }
+
+        // Provenance note: the parameters are baked into the payload, so say
+        // what produced these numbers and that the recording is intact.
+        if (this.placeholderNote) {
+            const masked = this.model.time_state.filter((v) => v === GRID_STATE.masked).length;
+            const bridged = this.model.time_state.filter((v) => v === GRID_STATE.bridged).length;
+            const resampledFrom = (this.model.interp || 'cubic_spline').replace(/_/g, ' ');
+            this.placeholderNote.textContent = 'Computed in Rust when this payload was prepared '
+                + `(${resampledFrom} interpolation onto a ${this.model.target_fs.toFixed(0)} Hz grid`
+                + `${this.model.norm ? `, normalization: ${this.model.norm.replace(/_/g, ' ')}` : ''}`
+                + `${this.model.max_gap_ms === null || this.model.max_gap_ms === undefined ? ', no gap limit' : `, gap limit ${this.model.max_gap_ms} ms`}). `
+                + `${bridged} bridged and ${masked} masked grid column(s); masked cells are withheld, not invented. `
+                + 'The recording itself is never truncated — CSV exports every grid column.';
+        }
+
+        if (this.hint) {
+            const meta = this.model;
+            const total = this.model.timestamps.length;
+            this.hint.textContent = `${meta.interp} · target ${meta.target_fs ? meta.target_fs.toFixed(0) : '—'} Hz · `
+                + `${total} grid column(s) · norm: ${meta.norm || 'none'} · `
+                + `max gap: ${meta.max_gap_ms === null ? 'no limit' : `${meta.max_gap_ms} ms`}`;
+        }
+
+        this.updateWindowControls();
+        this.drawMaskStrip();
+        for (const panel of this.model.panels) {
+            this.drawPanel(panel.id);
+        }
+        // Hide the normalized panel when it is not part of the model.
+        const normPanel = this.panels.amplitude_norm;
+        if (normPanel && normPanel.wrapper) {
+            normPanel.wrapper.hidden = !this.model.panels.some((p) => p.id === 'amplitude_norm');
+        }
+    }
+
+    // Window is per canvas and canvas-only: it never truncates the recording.
+    windowRange() {
+        const total = (this.model && this.model.timestamps && this.model.timestamps.length) || 0;
+        const length = this.windowLength ? Number(this.windowLength.value) : 30;
+        const duration = total > 0
+            ? this.model.timestamps[total - 1] - this.model.timestamps[0]
+            : 0;
+        const usable = Math.min(length, DSP_MAX_WINDOW_S, Math.max(duration, 0));
+        const start = this.windowStart ? Number(this.windowStart.value) : 0;
+        const maxStart = Math.max(0, duration - usable);
+        return { start: Math.min(start, maxStart), length: usable, duration, maxStart };
+    }
+
+    updateWindowControls() {
+        if (!this.windowStart || !this.model) return;
+        const total = this.model.timestamps.length;
+        const duration = total > 0 ? this.model.timestamps[total - 1] - this.model.timestamps[0] : 0;
+        const length = this.windowLength ? Number(this.windowLength.value) : 30;
+        const maxStart = Math.max(0, duration - Math.min(length, DSP_MAX_WINDOW_S));
+        this.windowStart.max = String(maxStart);
+        if (Number(this.windowStart.value) > maxStart) this.windowStart.value = String(maxStart);
+        if (this.windowReadout) {
+            const start = Number(this.windowStart.value);
+            this.windowReadout.textContent = `${start.toFixed(1)} – ${(start + Math.min(length, DSP_MAX_WINDOW_S)).toFixed(1)} s`;
+        }
+    }
+
+    // Grid state strip: one pixel per grid column.
+    drawMaskStrip() {
+        if (!this.maskCanvas || !this.model) return;
+        const states = this.model.time_state;
+        const ctx = this.maskCanvas.getContext('2d');
+        const dpr = window.devicePixelRatio || 1;
+        const rect = this.maskCanvas.getBoundingClientRect();
+        const width = Math.max(300, rect.width || 1200);
+        const height = 18;
+        this.maskCanvas.width = Math.round(width * dpr);
+        this.maskCanvas.height = Math.round(height * dpr);
+        this.maskCanvas.style.height = `${height}px`;
+        ctx.save();
+        ctx.scale(dpr, dpr);
+        ctx.clearRect(0, 0, width, height);
+        const colW = width / Math.max(states.length, 1);
+        for (let i = 0; i < states.length; i++) {
+            ctx.fillStyle = GRID_STATE_COLORS[states[i]] || GRID_STATE_COLORS[0];
+            ctx.fillRect(i * colW, 0, Math.max(colW, 1), height);
+        }
+        ctx.restore();
+    }
+
+    // Rows to draw for a panel: every subcarrier, minus null rows when the
+    // checkbox hides them. Physical bin indices are kept for the y axis.
+    visibleBins(scCount) {
+        const nulls = new Set((this.model && this.model.null_subcarriers) || []);
+        const hide = !!(this.hideNullCheckbox && this.hideNullCheckbox.checked);
+        const bins = [];
+        for (let sc = 0; sc < scCount; sc++) {
+            if (hide && nulls.has(sc)) continue;
+            bins.push(sc);
+        }
+        return bins;
+    }
+
+    drawPanel(id) {
+        const panel = this.panels[id];
+        if (!panel || !panel.canvas) return;
+        const modelPanel = this.model.panels.find((p) => p.id === id);
+        if (!modelPanel) return;
+
+        const canvas = panel.canvas;
+        const ctx = canvas.getContext('2d');
+        const data = modelPanel.data;
+        const scCount = (data[0] && data[0].length) || this.visualizer.getSubcarrierCount();
+        const nulls = new Set(this.model.null_subcarriers);
+        const hideNull = !!(this.hideNullCheckbox && this.hideNullCheckbox.checked);
+        const bins = this.visibleBins(scCount);
+        const range = this.windowRange();
+
+        // Columns inside the window.
+        const timestamps = this.model.timestamps;
+        const total = Math.min(data.length, timestamps.length);
+        const cols = [];
+        for (let j = 0; j < total; j++) {
+            const t = timestamps[j];
+            if (t >= range.start - 1e-9 && t <= range.start + range.length + 1e-9) cols.push(j);
+        }
+        if (cols.length === 0) return;
+
+        // Offscreen: one pixel per (column, visible bin).
+        this.offscreen.width = cols.length;
+        this.offscreen.height = Math.max(bins.length, 1);
+        const img = this.offCtx.createImageData(this.offscreen.width, this.offscreen.height);
+        const px = img.data;
+        const lut = COLORMAP_LUTS[panel.lut] || COLORMAP_LUTS.viridis;
+        const NULL_RGBA = [51, 65, 85];
+        const MASKED_RGBA = [71, 85, 105];
+
+        // Value range for this panel. The range is clipped to robust
+        // percentiles: a single multipath spike (this capture reaches 29 252
+        // against a median of 26) would otherwise pin the scale and collapse
+        // 99% of the data into one colour. Values outside are clamped to the
+        // end colours, and the true extent is reported in the panel meta.
+        let min = Infinity;
+        let max = -Infinity;
+        const samples = [];
+        for (const j of cols) {
+            const row = data[j];
+            for (const sc of bins) {
+                if (nulls.has(sc)) continue;
+                const v = row[sc];
+                if (!Number.isFinite(v)) continue;
+                samples.push(v);
+                if (v < min) min = v;
+                if (v > max) max = v;
+            }
+        }
+        if (!Number.isFinite(min) || !Number.isFinite(max)) { min = 0; max = 1; }
+        const fullMin = min;
+        const fullMax = max;
+        if (samples.length > 20) {
+            samples.sort((a, b) => a - b);
+            const lo = samples[Math.floor(0.02 * (samples.length - 1))];
+            const hi = samples[Math.floor(0.98 * (samples.length - 1))];
+            if (hi > lo) { min = lo; max = hi; }
+        }
+        // Cyclic panels span −π…π regardless of the data, so the colorbar means
+        // something stable and the wrap at ±π is visible.
+        if (panel.kind === 'cyclic') { min = -Math.PI; max = Math.PI; }
+        if (max - min < 1e-9) max = min + 1e-9;
+
+        for (let ci = 0; ci < cols.length; ci++) {
+            const j = cols[ci];
+            const state = this.model.time_state[j];
+            for (let ri = 0; ri < bins.length; ri++) {
+                const sc = bins[ri];
+                const py = bins.length - 1 - ri;
+                const pIdx = (py * cols.length + ci) * 4;
+                if (nulls.has(sc)) {
+                    px[pIdx] = NULL_RGBA[0];
+                    px[pIdx + 1] = NULL_RGBA[1];
+                    px[pIdx + 2] = NULL_RGBA[2];
+                    px[pIdx + 3] = 255;
+                    continue;
+                }
+                if (state === GRID_STATE.masked) {
+                    px[pIdx] = MASKED_RGBA[0];
+                    px[pIdx + 1] = MASKED_RGBA[1];
+                    px[pIdx + 2] = MASKED_RGBA[2];
+                    px[pIdx + 3] = 255;
+                    continue;
+                }
+                const value = data[j][sc];
+                const norm = Math.max(0, Math.min(1, (value - min) / (max - min)));
+                const lutIdx = Math.floor(norm * 255) * 3;
+                px[pIdx] = lut[lutIdx];
+                px[pIdx + 1] = lut[lutIdx + 1];
+                px[pIdx + 2] = lut[lutIdx + 2];
+                px[pIdx + 3] = 255;
+            }
+        }
+        this.offCtx.putImageData(img, 0, 0);
+
+        // Canvas sizing.
+        const rect = canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const width = Math.max(600, rect.width || 1200);
+        const height = Math.max(200, Math.round(width * 0.22));
+        canvas.width = Math.round(width * dpr);
+        canvas.height = Math.round(height * dpr);
+        canvas.style.height = `${height}px`;
+
+        ctx.save();
+        ctx.scale(dpr, dpr);
+        ctx.fillStyle = '#0b1120';
+        ctx.fillRect(0, 0, width, height);
+
+        const m = this.margin;
+        const plotX = m.left;
+        const plotY = m.top;
+        const plotW = width - m.left - m.right;
+        const plotH = height - m.top - m.bottom;
+
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(plotX, plotY, plotW, plotH);
+        ctx.clip();
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(this.offscreen, plotX, plotY, plotW, plotH);
+        ctx.restore();
+
+        ctx.strokeStyle = '#334155';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(plotX, plotY, plotW, plotH);
+
+        // Title + meta.
+        ctx.fillStyle = '#f8fafc';
+        ctx.font = '600 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+        ctx.fillText(modelPanel.title, plotX + plotW / 2, plotY - 10);
+
+        // Axes: time (x) and physical subcarrier bins (y).
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        const span = Math.max(range.length, 1e-9);
+        const step = this.niceStep(span / 6);
+        for (let t = 0; t <= span + 1e-9; t += step) {
+            const x = plotX + (t / span) * plotW;
+            ctx.fillText(`${(range.start + t).toFixed(step < 1 ? 1 : 0)}`, x, plotY + plotH + 8);
+        }
+        ctx.fillText('Time (s)', plotX + plotW / 2, plotY + plotH + 26);
+
+        ctx.textAlign = 'right';
+        ctx.textBaseline = 'middle';
+        const yTicks = 5;
+        for (let i = 0; i <= yTicks; i++) {
+            const sc = Math.round((bins.length - 1) * (i / yTicks));
+            const bin = bins[sc] !== undefined ? bins[sc] : 0;
+            const y = plotY + plotH - (i / yTicks) * plotH;
+            ctx.fillText(String(bin), plotX - 8, y);
+        }
+        ctx.save();
+        ctx.translate(14, plotY + plotH / 2);
+        ctx.rotate(-Math.PI / 2);
+        ctx.textAlign = 'center';
+        ctx.fillText('Subcarrier', 0, 0);
+        ctx.restore();
+
+        // Colorbar with its unit.
+        const cbX = plotX + plotW + 18;
+        const cbW = 14;
+        const grad = ctx.createLinearGradient(0, plotY + plotH, 0, plotY);
+        for (let i = 0; i <= 10; i++) {
+            const norm = i / 10;
+            const lutIdx = Math.floor(norm * 255) * 3;
+            grad.addColorStop(norm, `rgb(${lut[lutIdx]}, ${lut[lutIdx + 1]}, ${lut[lutIdx + 2]})`);
+        }
+        ctx.fillStyle = grad;
+        ctx.fillRect(cbX, plotY, cbW, plotH);
+        ctx.strokeStyle = '#334155';
+        ctx.strokeRect(cbX, plotY, cbW, plotH);
+        ctx.fillStyle = '#94a3b8';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        for (let i = 0; i <= 4; i++) {
+            const frac = i / 4;
+            const value = min + (max - min) * frac;
+            const y = plotY + plotH - frac * plotH;
+            ctx.fillText(this.formatTick(value), cbX + cbW + 5, y);
+        }
+        ctx.save();
+        ctx.translate(cbX + cbW + 52, plotY + plotH / 2);
+        ctx.rotate(-Math.PI / 2);
+        ctx.textAlign = 'center';
+        ctx.fillText(modelPanel.unit, 0, 0);
+        ctx.restore();
+
+        ctx.restore();
+
+        // Remember the geometry for hover hit-testing.
+        panel.plotBounds = { plotX, plotY, plotW, plotH, cols, bins, min, max, panel: modelPanel };
+        if (panel.meta) {
+            // Say the scale is clipped when it is, so nobody reads the colour
+            // bar as the full extent.
+            const clipped = fullMax > max + 1e-9 || fullMin < min - 1e-9;
+            const scaleText = panel.kind === 'cyclic'
+                ? '−π…π'
+                : `${min.toFixed(1)}…${max.toFixed(1)}${clipped ? ` (clipped, full ${fullMin.toFixed(1)}…${fullMax.toFixed(1)})` : ''}`;
+            panel.meta.textContent = `${cols.length} column(s) shown · ${bins.length}/${scCount} subcarriers · `
+                + `${modelPanel.unit} ${scaleText}`;
+        }
+    }
+
+    // Compact tick label: switches to exponential form when the magnitude makes
+    // a fixed-point label unreadable (a 5-digit amplitude, a denormal).
+    formatTick(value) {
+        if (!Number.isFinite(value)) return String(value);
+        const magnitude = Math.abs(value);
+        if (magnitude !== 0 && (magnitude >= 10_000 || magnitude < 0.01)) {
+            return value.toExponential(1);
+        }
+        return magnitude >= 100 ? value.toFixed(0) : value.toFixed(1);
+    }
+
+    niceStep(raw) {
+        const steps = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 20, 30, 60, 120, 300];
+        for (const s of steps) if (raw <= s) return s;
+        return steps[steps.length - 1];
+    }
+
+    onMouseMove(event, id) {
+        const panel = this.panels[id];
+        if (!panel || !panel.plotBounds || !panel.tooltip) return;
+        const { plotX, plotY, plotW, plotH, cols, bins, panel: modelPanel } = panel.plotBounds;
+        const rect = panel.canvas.getBoundingClientRect();
+        const x = event.clientX - rect.left;
+        const y = event.clientY - rect.top;
+        if (x < plotX || x > plotX + plotW || y < plotY || y > plotY + plotH) {
+            this.hideTooltip(id);
+            return;
+        }
+        const ci = Math.min(cols.length - 1, Math.floor(((x - plotX) / plotW) * cols.length));
+        const ri = Math.min(bins.length - 1, bins.length - 1 - Math.floor(((y - plotY) / plotH) * bins.length));
+        const j = cols[ci];
+        const sc = bins[ri];
+        const nulls = new Set(this.model.null_subcarriers);
+        const state = this.model.time_state[j];
+        const stateName = ['observed', 'bridged', 'masked'][state] || 'unknown';
+        const value = modelPanel.data[j][sc];
+        const t = this.model.timestamps[j];
+
+        let valueText;
+        if (nulls.has(sc)) {
+            valueText = 'null subcarrier (masked)';
+        } else if (state === GRID_STATE.masked) {
+            valueText = 'withheld (gap over the limit)';
+        } else if (Number.isFinite(value)) {
+            valueText = value.toFixed(3);
+        } else {
+            valueText = '—';
+        }
+        panel.tooltip.innerHTML = `<div class="tip-title">grid #${j} · SC ${sc} — ${valueText}</div>`
+            + `<div class="tip-body">t = ${t.toFixed(3)} s · state: ${stateName} · ${modelPanel.unit}</div>`;
+        panel.tooltip.style.display = 'block';
+        const wrap = panel.tooltip.parentElement;
+        const wrapRect = wrap.getBoundingClientRect();
+        let left = event.clientX - wrapRect.left + 14;
+        let top = event.clientY - wrapRect.top + 14;
+        const tw = panel.tooltip.offsetWidth;
+        const th = panel.tooltip.offsetHeight;
+        if (left + tw > wrapRect.width - 6) left = event.clientX - wrapRect.left - tw - 10;
+        if (top + th > wrapRect.height - 6) top = event.clientY - wrapRect.top - th - 10;
+        panel.tooltip.style.left = `${Math.max(4, left)}px`;
+        panel.tooltip.style.top = `${Math.max(4, top)}px`;
+    }
+
+    hideTooltip(id) {
+        const panel = this.panels[id];
+        if (panel && panel.tooltip) panel.tooltip.style.display = 'none';
+    }
+
+    // CSV export: the FULL recording (never the visible window), one row per
+    // grid column, one column per subcarrier, with a '#' provenance header so
+    // `pandas.read_csv(path, comment='#')` loads it directly. Null subcarriers
+    // follow the "Hide null subcarriers" option, and masked cells are left
+    // empty rather than filled with an invented value.
+    exportCsv(id) {
+        const panel = this.panels[id];
+        const modelPanel = this.model && this.model.panels.find((p) => p.id === id);
+        if (!panel || !modelPanel) return;
+
+        const data = modelPanel.data;
+        const timestamps = this.model.timestamps;
+        const rows = Math.min(data.length, timestamps.length);
+        const scCount = (data[0] && data[0].length) || 0;
+        const nulls = new Set(this.model.null_subcarriers || []);
+        const hideNull = !!(this.hideNullCheckbox && this.hideNullCheckbox.checked);
+        const bins = hideNull ? this.visibleBins(scCount) : Array.from({ length: scCount }, (_, k) => k);
+
+        const masked = new Set();
+        for (let j = 0; j < rows; j++) {
+            if (this.model.time_state[j] === GRID_STATE.masked) masked.add(j);
+        }
+
+        const lines = [];
+        // Provenance header: everything needed to interpret the numbers, so a
+        // file kept for later analysis is self-describing.
+        lines.push('# RT-Wireless-Sensing — DSP view export');
+        lines.push(`# panel=${modelPanel.id} title="${modelPanel.title}" unit=${modelPanel.unit} kind=${modelPanel.kind}`);
+        lines.push(`# interp=${this.model.interp} target_fs=${this.model.target_fs} norm=${this.model.norm || 'none'}`);
+        lines.push(`# max_gap_ms=${this.model.max_gap_ms === null || this.model.max_gap_ms === undefined ? 'none' : this.model.max_gap_ms}`);
+        const src = (this.data && this.data.metadata && this.data.metadata.source) || 'unknown';
+        lines.push(`# source="${src}" grid_columns=${rows} subcarriers=${bins.length} null_subcarriers=${hideNull ? 'hidden' : (this.model.null_subcarriers || []).join('|') || 'none'}`);
+        lines.push(`# time_state: 0=observed 1=bridged 2=masked; masked_cells=empty`);
+        lines.push(`# exported=${new Date().toISOString()}`);
+
+        const header = ['time_s', 'grid_index', 'time_state'].concat(bins.map((k) => `sc_${k}`));
+        lines.push(header.join(','));
+
+        const stateNames = ['observed', 'bridged', 'masked'];
+        for (let j = 0; j < rows; j++) {
+            const row = data[j];
+            const cells = new Array(bins.length);
+            const isMasked = masked.has(j);
+            for (let i = 0; i < bins.length; i++) {
+                const value = row[bins[i]];
+                cells[i] = isMasked || !Number.isFinite(value) ? '' : String(value);
+            }
+            const state = stateNames[this.model.time_state[j]] || 'unknown';
+            lines.push([timestamps[j].toFixed(6), j, state].concat(cells).join(','));
+        }
+
+        const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        const stem = (src || 'capture').replace(/\.[^.]+$/, '');
+        link.href = url;
+        link.download = `${stem}_dsp_${modelPanel.id}.csv`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+
+        if (panel.meta) {
+            panel.meta.textContent = `exported ${rows} row(s) × ${bins.length} subcarrier(s) — full recording`;
+        }
+    }
+}
+
 // Global bootstrap
 document.addEventListener('DOMContentLoaded', async () => {
     const visualizer = new CsiVisualizer('heatmapCanvas');
     visualizer.diagnosticView = new DiagnosticView(visualizer);
+    visualizer.dspView = new DspView(visualizer);
     const loadingOverlay = document.getElementById('loadingOverlay');
     const loadingText = document.getElementById('loadingText');
     let hideTimer = null;
@@ -1626,8 +2345,10 @@ document.addEventListener('DOMContentLoaded', async () => {
             return;
         }
 
-        // Live server: { status: "ready", data: {...} }
+        // Live server: { status: "ready", data: {...} } — DSP is never computed
+        // during streaming, so the DSP view shows its note instead of panels.
         if (payload.status === 'ready' && payload.data && payload.data.amplitudes) {
+            visualizer.live = true;
             visualizer.setData(payload.data);
             hideLoading();
             return;
@@ -1635,6 +2356,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         // Static server: the payload itself is VisualizationData.
         if (payload.amplitudes) {
+            visualizer.live = false;
             visualizer.setData(payload);
             hideLoading();
             staticLoaded = true;
@@ -1643,6 +2365,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // 1. Check for inlined data (standalone HTML bundle)
     if (window.CSI_DATA && window.CSI_DATA.amplitudes) {
+        visualizer.live = false;
         visualizer.setData(window.CSI_DATA);
         hideLoading();
         return;

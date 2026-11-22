@@ -32,7 +32,15 @@ Hiển thị thống kê ghi quan trọng cùng với heatmap:
 * **Thời gian bắt đầu**: Bắt đầu tương đối và đồng hồ thiết bị đơn điệu (`device_ticks_us`).
 * **Thời lượng**: Tổng thời gian ghi đã trôi qua tính bằng giây.
 * **Khung đã giải mã**: Tổng số bản ghi CSI hợp lệ ($N$).
-* **Tốc độ hiệu quả**: Gói mỗi giây (PPS) tính từ delta đồng hồ thiết bị.
+* **Tốc độ gói**: Hai giá trị cạnh nhau.
+  * **Nominal** — đối số `--pps` được yêu cầu (`metadata.nominal_pps`). Khi
+    không truyền `--pps` (`nominal_pps` là `null`), thẻ hiển thị tốc độ danh nghĩa
+    mặc định (20 PPS, `collection::DEFAULT_PPS` / `DEFAULT_NOMINAL_PPS` ở lớp
+    web) với kiểu chữ mờ và ghi rõ trong chú thích; không bao giờ trình bày giá
+    trị mặc định như một giá trị được yêu cầu.
+  * **Effective** — tốc độ đo được, `(số khung − 1) / thời lượng`, tính từ delta
+    đồng hồ thiết bị (`metadata.effective_pps`). Luôn là giá trị đo, không bao
+    giờ dùng làm giá trị thay thế cho nominal.
 
 ### 3. Khu vực kết quả phân loại
 Cung cấp thẻ chuyên dụng hiển thị lớp hoạt động hoặc cử chỉ được dự đoán (ví dụ "Chế độ chờ / Không", "Đi bộ", "Vẫy tay") với mức độ tin cậy khi kết quả phân loại được kết nối.
@@ -47,9 +55,11 @@ trong đó `N` là PPS danh định, và báo cáo:
 ```
 
 Kết quả được hiển thị trong hàng hover dưới dạng **Độ chiếm chỗ (nhấp)**, ví dụ
-`87.0% (87/100 @ 24s)`. Lệnh phát trực tuyến đặt `N` từ `--pps`; bản ghi tĩnh
-sử dụng PPS hiệu quả được đo. Giá trị được tính toán lại trên mỗi lần làm mới dữ liệu trực tiếp
-và biến mất khi giây rời khỏi cửa sổ 30 giây.
+`87.0% (87/100 @ 24s)`. `N` là tốc độ *danh định*: lệnh phát trực tuyến truyền
+`--pps` (`metadata.nominal_pps`), còn bản ghi giải mã không có `--pps` dùng tốc
+độ danh định mặc định (20 PPS) — không dùng tốc độ đo được, vì giá trị đó được
+báo cáo riêng là effective PPS. Giá trị được tính toán lại trên mỗi lần làm mới
+dữ liệu trực tiếp và biến mất khi giây rời khỏi cửa sổ 30 giây.
 
 Đây là phép tính phía trình duyệt trên `timestamps` hiển thị; không có điểm cuối bổ sung nào liên quan.
 
@@ -158,13 +168,102 @@ báo là `ambiguous` thay vì đoán.
 
 #### `--pps` cho tệp ngoại tuyến
 
-Không có `--pps`, tệp ngoại tuyến dùng tốc độ hiệu quả đo được, làm lưới co lại
-đúng ở những giây bị thiếu mẫu. Hãy truyền tốc độ đã cấu hình để giữ lưới đúng
-kích thước:
+Không có `--pps`, `metadata.nominal_pps` là `null` và lưới khe dùng tốc độ danh
+định mặc định (20 PPS), nên bản ghi thu nhanh hơn 20 PPS sẽ báo nhiều hơn một
+phép đo mỗi khe. Hãy truyền tốc độ lúc thu để lưới, đầu ra độ chiếm chỗ và các
+khe chẩn đoán có đúng kích thước dự kiến:
 
 ```bash
 cargo run --bin visualize -- capture_v8.bin --pps 100
 ```
+
+### 6. DSP view (tái lấy mẫu và chuẩn hóa)
+
+Bộ panel thứ hai, tùy chọn, được tính **một lần trong Rust** từ đúng các packet
+đã giải mã như heatmap và nhúng vào payload. Nó chỉ có cho dữ liệu ngoại tuyến:
+khi bảng điều khiển đang streaming, `dsp` là `null` và công tắc được thay bằng
+ghi chú *"DSP analysis is available after streaming is closed."*
+
+Trình duyệt không bao giờ tái lấy mẫu hay chuẩn hóa. Nó chỉ định dạng những gì
+Rust đã tính, nên mỗi công thức chỉ có đúng một bản triển khai.
+
+#### Các panel
+
+| Panel | `kind` | Đơn vị | Nội dung |
+|---|---|---|---|
+| `amplitude` | `sequential` | `a.u.` | $\lvert h_k(t)\rvert$ sau tái lấy mẫu trên lưới đều |
+| `phase` | `cyclic` | `rad` | $\arg h_k(t)$ sau tái lấy mẫu, ánh xạ màu trên $-\pi\ldots\pi$ |
+| `amplitude_norm` | `diverging` | `z` hoặc `0–1` | Biên độ đã chuẩn hóa; chỉ xuất hiện khi có chọn scheme |
+
+Pha là `atan2(Q, I)` trên các giá trị I/Q đã nội suy, không bao giờ nội suy trực
+tiếp pha: pha thô bị wrap tại $\pm\pi$, nên nội suy nó sẽ tạo ra những điểm gián
+đoạn không hề tồn tại trong tín hiệu.
+
+Panel biên độ cắt thang màu theo phân vị 2–98 và ghi toàn dải thật trong phần
+meta của panel. Nếu không, một đỉnh đa đường (bản ghi này chạm 29 252 so với
+trung vị 26) sẽ ghim thang và ép 99% dữ liệu vào một màu duy nhất.
+
+#### Lưới
+
+Tốc độ lưới là `slots_per_second` (PPS danh nghĩa được làm tròn một lần trong
+Rust), nên cột tái lấy mẫu `j` ánh xạ tới slot chẩn đoán
+`(second = j / N, slot = j % N)`. Nhờ vậy lưới slot chẩn đoán và các panel DSP
+khớp nhau chính xác.
+
+#### Che (masking)
+
+Mask có thể **tách rời**, nên không phải gửi ma trận từng ô:
+
+- **Subcarrier null** (`null_subcarriers`): tám bin bảo vệ/DC của bản ghi HT20
+  căn giữa, `{0,1,2,3,32,61,62,63}`. Chúng không bao giờ mang thông tin kênh,
+  không bao giờ được vẽ như một số `0` thật, và bị loại khỏi mọi phép biến đổi
+  theo trục subcarrier (`normalize` với `PerSample` chỉ tính trung bình và độ
+  lệch trên các cột không null). Panel có tùy chọn **Hide null subcarriers**;
+  nhãn trục y vẫn giữ chỉ số bin vật lý.
+- **Cột thời gian** (`time_state`): `0` quan sát được, `1` bắc cầu, `2` bị che.
+  Một cột là *bắc cầu* khi nó được nội suy qua khoảng trống dài hơn 1.5 chu kỳ
+  danh nghĩa, và *bị che* khi khoảng trống đó vượt `max_gap_ms`. Ô bị che được
+  giữ lại — vẽ dạng gạch chéo và xuất rỗng — chứ không điền giá trị bịa.
+
+Khi đặt ngưỡng khoảng trống, chuỗi nguồn được chia tại mỗi khoảng trống vượt
+ngưỡng và mỗi đoạn được nội suy độc lập. Spline bậc ba tự nhiên là phép khớp
+toàn cục, nên nếu nội suy xuyên qua chỗ mất dữ liệu rồi mới che đi thì chỗ mất
+dữ liệu đó vẫn làm lệch các điểm lân cận.
+
+#### Cửa sổ thời gian
+
+Mọi canvas DSP dùng chung một bộ chọn cửa sổ thời gian (mặc định 30 s, tối đa 5
+phút). Đây **chỉ là giới hạn của canvas**: bản ghi và bản xuất CSV luôn giữ đủ
+mọi cột lưới.
+
+#### Xuất CSV
+
+Mỗi panel có nút **Export CSV**. Tệp bao phủ **toàn bộ bản ghi**, không phải cửa
+sổ đang xem: một dòng cho mỗi cột lưới, một cột cho mỗi subcarrier, đứng trước là
+các dòng nguồn gốc `#` (`interp`, `target_fs`, `norm`, `max_gap_ms`, nguồn) để
+nạp trực tiếp bằng `pandas.read_csv(path, comment='#')`. Ô bị che để trống, và
+cột `time_state` cho biết lý do.
+
+#### Payload
+
+```json
+"dsp": {
+  "interp": "cubic_spline",
+  "target_fs": 100.0,
+  "norm": null,
+  "max_gap_ms": null,
+  "timestamps": [0.0, 0.01, "…"],
+  "null_subcarriers": [0, 1, 2, 3, 32, 61, 62, 63],
+  "time_state": [0, 0, 1, "…"],
+  "panels": [
+    { "id": "amplitude", "title": "Amplitude — resampled", "unit": "a.u.", "kind": "sequential", "data": [["…"]] },
+    { "id": "phase", "title": "Phase — resampled", "unit": "rad", "kind": "cyclic", "data": [["…"]] }
+  ]
+}
+```
+
+`dsp` được đánh dấu `#[serde(default)]`, nên payload tạo trước tính năng này vẫn
+phân tích được với `null` và giao diện web chỉ đơn giản ẩn công tắc.
 
 ## CLI độc lập
 
@@ -189,7 +288,11 @@ cargo run --bin visualize -- capture_v8.bin --serve --port 8080
 | `FILE` | Tệp ghi thô được viết bởi `collect` (mặc định: `capture_v8.bin`) |
 | `-o, --output FILE` | Đường dẫn đích cho bảng điều khiển HTML độc lập (mặc định: `<stem>_heatmap.html`) |
 | `--json FILE` | Đường dẫn xuất dữ liệu hiển thị JSON |
-| `--pps PPS` | Tốc độ gói danh định cho lưới khe chẩn đoán (mặc định: tốc độ hiệu quả đo được) |
+| `--pps PPS` | Tốc độ gói danh định, hiển thị là **Nominal** trên UI, dùng cho lưới khe chẩn đoán/độ chiếm chỗ và lưới DSP. Không truyền thì `metadata.nominal_pps` là `null`, UI hiển thị tốc độ danh định mặc định (20 PPS), và lưới DSP dùng tốc độ đo được |
+| `--no-dsp` | Bỏ qua DSP view tính sẵn để giữ payload nhỏ; công tắc DSP vẫn ẩn |
+| `--dsp-interp M` | Phương pháp nội suy khi tái lấy mẫu: `nearest`, `linear` hoặc `cubic` (mặc định: `cubic`) |
+| `--dsp-norm S` | Chuẩn hóa áp dụng chồng lên kết quả tái lấy mẫu: `none`, `per-subcarrier`, `per-sample` hoặc `min-max` (mặc định: `none`) |
+| `--dsp-max-gap-ms MS` | Che các cột lưới có khoảng trống nguồn vượt `MS` mili giây (mặc định: không ngưỡng, mọi khoảng trống đều được bắc cầu) |
 | `--serve` | Khởi động máy chủ web nhúng không đồng bộ |
 | `--port PORT` | Cổng cho máy chủ web (mặc định: `8080`) |
 | `--open` | Mở tệp HTML đã tạo hoặc URL máy chủ web trong trình duyệt hệ thống mặc định |
@@ -334,6 +437,7 @@ một tệp vẫn đang được ghi:
 cargo run --bin streaming -- --ip 10.178.22.9 --output capture_v8.bin --pps 100 --port 8080
 ```
 
-Trường metadata `nominal_pps` là số lượng khe được sử dụng bởi đầu ra độ chiếm chỗ.
-Mô-đun phát trực tuyến đặt nó thành `--pps` được cấu hình; hiển thị dựa trên tệp
-mặc định nó thành `effective_pps` được đo.
+Trường metadata `nominal_pps` là số lượng khe được sử dụng bởi đầu ra độ chiếm
+chỗ. Mô-đun phát trực tuyến đặt nó thành `--pps` được cấu hình; bản ghi giải mã
+không có `--pps` để nó là `null` và UI hiển thị tốc độ danh định mặc định
+(20 PPS) cạnh `effective_pps` đo được.

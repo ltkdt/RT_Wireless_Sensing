@@ -39,6 +39,268 @@ pub enum InterpMethod {
     CubicSpline,
 }
 
+impl InterpMethod {
+    /// Lower-case name used in the JSON payload (`"nearest"`, `"linear"`,
+    /// `"cubic_spline"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Nearest => "nearest",
+            Self::Linear => "linear",
+            Self::CubicSpline => "cubic_spline",
+        }
+    }
+}
+
+/// Provenance of one grid column, as shipped to the web layer.
+///
+/// * [`GridState::Observed`] — both source neighbours sit within 1.5 nominal
+///   intervals, so the column is effectively a real measurement.
+/// * [`GridState::Bridged`] — interpolated across a longer gap.
+/// * [`GridState::Masked`] — the gap is longer than the configured threshold:
+///   the value is present but must not be trusted (rendered hatched).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GridState {
+    /// Interpolated between two close source samples.
+    #[default]
+    Observed = 0,
+    /// Interpolated across a gap longer than 1.5 nominal intervals.
+    Bridged = 1,
+    /// Interpolated across a gap longer than `max_gap_us`.
+    Masked = 2,
+}
+
+impl GridState {
+    /// Wire value: `0` observed, `1` bridged, `2` masked.
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Options for [`CsiSignal::resample_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ResampleOptions {
+    /// Gaps longer than this are masked instead of bridged. `None` disables
+    /// the threshold, so every gap is interpolated (default).
+    pub max_gap_us: Option<u64>,
+}
+
+/// Result of [`CsiSignal::resample_with`]: the resampled signal plus the
+/// per-grid-column provenance.
+#[derive(Debug, Clone)]
+pub struct ResampleOutput {
+    /// Resampled signal on the uniform grid.
+    pub signal: CsiSignal,
+    /// One entry per grid column (same length as `signal.n_samples()`).
+    pub grid_state: Vec<GridState>,
+    /// Nominal source interval in microseconds (median positive tick gap).
+    pub nominal_interval_us: f64,
+}
+
+impl CsiSignal {
+    /// Resample and report per-column provenance — the form
+    /// [`crate::visualization`] uses for the DSP view.
+    ///
+    /// Behaves exactly like [`CsiSignal::resample`] apart from the gap
+    /// handling: when `options.max_gap_us` is set, the source series is split
+    /// at every over-threshold gap and each segment is interpolated
+    /// independently. A natural cubic spline is a *global* fit, so interpolating
+    /// across a long dropout and masking it afterwards would let that dropout
+    /// distort its neighbours; splitting keeps the surviving segments clean.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`CsiSignal::resample`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ndarray::{Array1, Array2};
+    /// use rt_wireless_sensing::dsp::{CsiSignal, GridState, InterpMethod, ResampleOptions};
+    ///
+    /// // 41 samples at 20 Hz with a 400 ms hole at index 20.
+    /// let ticks: Array1<u64> = (0..41u64)
+    ///     .map(|i| i * 50_000 + if i >= 20 { 400_000 } else { 0 })
+    ///     .collect();
+    /// let amplitude = Array2::from_elem((41, 1), 1.0);
+    /// let signal = CsiSignal::new(amplitude, Array2::zeros((41, 1)), ticks).unwrap();
+    ///
+    /// let out = signal
+    ///     .resample_with(20.0, InterpMethod::CubicSpline, ResampleOptions { max_gap_us: Some(100_000) })
+    ///     .unwrap();
+    /// assert!(out.grid_state.iter().any(|s| *s == GridState::Masked));
+    /// ```
+    pub fn resample_with(
+        &self,
+        target_fs: f64,
+        method: InterpMethod,
+        options: ResampleOptions,
+    ) -> Result<ResampleOutput, DspError> {
+        if !target_fs.is_finite() || target_fs <= 0.0 {
+            return Err(DspError::InvalidConfig(format!(
+                "target_fs must be positive and finite, got {target_fs}"
+            )));
+        }
+        let n = self.n_samples();
+        if n < 2 {
+            return Err(DspError::InvalidConfig(
+                "need at least 2 samples to resample".to_string(),
+            ));
+        }
+
+        let t0 = self.ticks_us[0];
+        // Source times in seconds, dropping duplicate ticks, erroring on
+        // regressions (same rule as `resample`).
+        let mut src_t: Vec<f64> = Vec::with_capacity(n);
+        let mut src_idx: Vec<usize> = Vec::with_capacity(n);
+        for i in 0..n {
+            let ti = (self.ticks_us[i] - t0) as f64 / 1e6;
+            match src_t.last() {
+                Some(&last) if ti < last => {
+                    return Err(DspError::NonMonotonicTicks {
+                        index: i,
+                        previous: self.ticks_us[i - 1],
+                        found: self.ticks_us[i],
+                    });
+                }
+                Some(&last) if ti == last => continue, // drop duplicate
+                _ => {}
+            }
+            src_t.push(ti);
+            src_idx.push(i);
+        }
+        if src_t.len() < 2 {
+            return Err(DspError::InvalidConfig(
+                "fewer than 2 distinct timestamps; cannot interpolate".to_string(),
+            ));
+        }
+
+        // Nominal interval: median positive gap over the deduplicated source.
+        let nominal_interval_us = {
+            let mut gaps: Vec<f64> = src_t
+                .windows(2)
+                .map(|w| (w[1] - w[0]) * 1e6)
+                .filter(|g| *g > 0.0)
+                .collect();
+            gaps.sort_by(f64::total_cmp);
+            if gaps.is_empty() {
+                return Err(DspError::ZeroVariance(
+                    "all device tick intervals are zero; no sample rate exists".to_string(),
+                ));
+            }
+            gaps[gaps.len() / 2]
+        };
+
+        let duration = *src_t.last().unwrap();
+        let m = (duration * target_fs).floor() as usize + 1;
+        let grid: Vec<f64> = (0..m).map(|j| j as f64 / target_fs).collect();
+
+        // Classify each grid column by the source gap it falls into.
+        let bridged_limit_s = 1.5 * nominal_interval_us / 1e6;
+        let masked_limit_s = options.max_gap_us.map(|us| us as f64 / 1e6);
+        let mut grid_state = vec![GridState::Observed; m];
+        for (j, &u) in grid.iter().enumerate() {
+            if u <= src_t[0] || u >= *src_t.last().unwrap() {
+                // Clamped to an endpoint, i.e. exactly a source sample.
+                grid_state[j] = GridState::Observed;
+                continue;
+            }
+            let i = segment_index(&src_t, u);
+            let gap = src_t[i + 1] - src_t[i];
+            grid_state[j] = if masked_limit_s.is_some_and(|limit| gap > limit) {
+                GridState::Masked
+            } else if gap > bridged_limit_s {
+                GridState::Bridged
+            } else {
+                GridState::Observed
+            };
+        }
+
+        // With a threshold, interpolate one segment at a time and write the
+        // result only where the grid falls inside that segment.
+        let ranges: Vec<(usize, usize)> = match masked_limit_s {
+            Some(limit) => segment_ranges(&src_t, limit),
+            None => vec![(0, src_t.len() - 1)],
+        };
+
+        let cx = self.complex();
+        let sc = self.n_subcarriers();
+        let mut out_iq = Array2::<Complex<f64>>::zeros((m, sc));
+
+        let mut starts: Vec<usize> = ranges.iter().map(|(a, _)| *a).collect();
+        starts.sort_unstable();
+        for k in 0..sc {
+            let re: Vec<f64> = src_idx.iter().map(|&i| cx[[i, k]].re).collect();
+            let im: Vec<f64> = src_idx.iter().map(|&i| cx[[i, k]].im).collect();
+            for &(a, b) in &ranges {
+                // Sample points of this segment, plus the global query grid
+                // restricted to the segment's span.
+                let seg_t = &src_t[a..=b];
+                let seg_re = &re[a..=b];
+                let seg_im = &im[a..=b];
+                let lo = seg_t[0];
+                let hi = seg_t[seg_t.len() - 1];
+                let mut query: Vec<f64> = Vec::new();
+                let mut slots: Vec<usize> = Vec::new();
+                for (j, &u) in grid.iter().enumerate() {
+                    if u >= lo && u <= hi {
+                        query.push(u);
+                        slots.push(j);
+                    }
+                }
+                if query.is_empty() {
+                    continue;
+                }
+                let (re_out, im_out) = match method {
+                    InterpMethod::Nearest => (
+                        interp_nearest(seg_t, seg_re, &query),
+                        interp_nearest(seg_t, seg_im, &query),
+                    ),
+                    InterpMethod::Linear => (
+                        interp_linear(seg_t, seg_re, &query),
+                        interp_linear(seg_t, seg_im, &query),
+                    ),
+                    InterpMethod::CubicSpline => {
+                        let m_re = natural_cubic_second(seg_t, seg_re);
+                        let m_im = natural_cubic_second(seg_t, seg_im);
+                        (
+                            query
+                                .iter()
+                                .map(|&u| spline_eval(seg_t, seg_re, &m_re, u))
+                                .collect(),
+                            query
+                                .iter()
+                                .map(|&u| spline_eval(seg_t, seg_im, &m_im, u))
+                                .collect(),
+                        )
+                    }
+                };
+                for (q, &j) in slots.iter().enumerate() {
+                    out_iq[[j, k]] = Complex::new(re_out[q], im_out[q]);
+                }
+            }
+        }
+
+        let mut tick_vec = Vec::with_capacity(m);
+        let mut prev = t0;
+        for &u in &grid {
+            let raw = t0.saturating_add((u * 1e6).round() as u64);
+            let v = raw.max(t0).max(if prev > t0 { prev + 1 } else { t0 });
+            tick_vec.push(v);
+            prev = v;
+        }
+        let ticks = Array1::from_vec(tick_vec);
+
+        let mut signal = CsiSignal::from_iq(out_iq, ticks)?;
+        signal.fs = target_fs;
+        signal.null_bins = self.null_bins.clone();
+        Ok(ResampleOutput {
+            signal,
+            grid_state,
+            nominal_interval_us,
+        })
+    }
+}
+
 impl CsiSignal {
     /// Resample the whole record onto a uniform grid at `target_fs` Hz using
     /// `method`, interpolating the complex I/Q values per subcarrier.
@@ -81,93 +343,11 @@ impl CsiSignal {
     /// assert!(t0[0].abs() < 1e-12);
     /// ```
     pub fn resample(&self, target_fs: f64, method: InterpMethod) -> Result<CsiSignal, DspError> {
-        if !target_fs.is_finite() || target_fs <= 0.0 {
-            return Err(DspError::InvalidConfig(format!(
-                "target_fs must be positive and finite, got {target_fs}"
-            )));
-        }
-        let n = self.n_samples();
-        if n < 2 {
-            return Err(DspError::InvalidConfig(
-                "need at least 2 samples to resample".to_string(),
-            ));
-        }
-
-        let t0 = self.ticks_us[0];
-        // Source times in seconds, dropping duplicate ticks, erroring on
-        // regressions.
-        let mut src_t: Vec<f64> = Vec::with_capacity(n);
-        let mut src_idx: Vec<usize> = Vec::with_capacity(n);
-        for i in 0..n {
-            let ti = (self.ticks_us[i] - t0) as f64 / 1e6;
-            match src_t.last() {
-                Some(&last) if ti < last => {
-                    return Err(DspError::NonMonotonicTicks {
-                        index: i,
-                        previous: self.ticks_us[i - 1],
-                        found: self.ticks_us[i],
-                    });
-                }
-                Some(&last) if ti == last => continue, // drop duplicate
-                _ => {}
-            }
-            src_t.push(ti);
-            src_idx.push(i);
-        }
-        if src_t.len() < 2 {
-            return Err(DspError::InvalidConfig(
-                "fewer than 2 distinct timestamps; cannot interpolate".to_string(),
-            ));
-        }
-
-        let duration = *src_t.last().unwrap();
-        let m = (duration * target_fs).floor() as usize + 1;
-        let grid: Vec<f64> = (0..m).map(|j| j as f64 / target_fs).collect();
-
-        let cx = self.complex();
-        let sc = self.n_subcarriers();
-        let mut out_iq = Array2::<Complex<f64>>::zeros((m, sc));
-        for k in 0..sc {
-            let re: Vec<f64> = src_idx.iter().map(|&i| cx[[i, k]].re).collect();
-            let im: Vec<f64> = src_idx.iter().map(|&i| cx[[i, k]].im).collect();
-            let (re_out, im_out) = match method {
-                InterpMethod::Nearest => (
-                    interp_nearest(&src_t, &re, &grid),
-                    interp_nearest(&src_t, &im, &grid),
-                ),
-                InterpMethod::Linear => (
-                    interp_linear(&src_t, &re, &grid),
-                    interp_linear(&src_t, &im, &grid),
-                ),
-                InterpMethod::CubicSpline => {
-                    let m_re = natural_cubic_second(&src_t, &re);
-                    let m_im = natural_cubic_second(&src_t, &im);
-                    (
-                        grid.iter().map(|&u| spline_eval(&src_t, &re, &m_re, u)).collect(),
-                        grid.iter().map(|&u| spline_eval(&src_t, &im, &m_im, u)).collect(),
-                    )
-                }
-            };
-            for j in 0..m {
-                out_iq[[j, k]] = Complex::new(re_out[j], im_out[j]);
-            }
-        }
-
-        // Uniform ticks anchored at the first source tick, kept strictly
-        // increasing even if target_fs is huge relative to 1 MHz.
-        let mut tick_vec = Vec::with_capacity(m);
-        let mut prev = t0;
-        for &u in &grid {
-            let raw = t0.saturating_add((u * 1e6).round() as u64);
-            let v = raw.max(t0).max(if prev > t0 { prev + 1 } else { t0 });
-            tick_vec.push(v);
-            prev = v;
-        }
-        let ticks = Array1::from_vec(tick_vec);
-
-        let mut signal = CsiSignal::from_iq(out_iq, ticks)?;
-        signal.fs = target_fs;
-        Ok(signal)
+        // One implementation of the rule: the no-threshold case of
+        // `resample_with` interpolates the whole record at once, so this is
+        // the historical behaviour with the provenance side product dropped.
+        self.resample_with(target_fs, method, ResampleOptions::default())
+            .map(|out| out.signal)
     }
 }
 
@@ -176,6 +356,27 @@ fn segment_index(t: &[f64], u: f64) -> usize {
     let n = t.len();
     let pp = t.partition_point(|&x| x <= u);
     pp.saturating_sub(1).min(n - 2)
+}
+
+/// Inclusive index ranges `(first, last)` of the source series split at every
+/// gap longer than `max_gap_s` seconds.
+///
+/// Segments share their boundary source sample (the last point of one segment
+/// is the first point of the next), so no source sample is lost and each
+/// segment interpolates only its own span. A series without over-threshold
+/// gaps yields the single range covering everything.
+fn segment_ranges(t: &[f64], max_gap_s: f64) -> Vec<(usize, usize)> {
+    let n = t.len();
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    for i in 0..n.saturating_sub(1) {
+        if t[i + 1] - t[i] > max_gap_s {
+            ranges.push((start, i));
+            start = i + 1;
+        }
+    }
+    ranges.push((start, n - 1));
+    ranges
 }
 
 /// Nearest-neighbor interpolation of `y` at the query points `grid`.
@@ -433,5 +634,161 @@ mod tests {
         let grid = vec![0.4, 0.6, 1.4, 1.6];
         let out = interp_nearest(&t, &y, &grid);
         assert_eq!(out, vec![10.0, 20.0, 20.0, 30.0]);
+    }
+
+    /// 20 Hz source with a hole of `gap_us` inserted after index `hole_at`.
+    fn signal_with_gap(n: usize, hole_at: usize, gap_us: u64) -> CsiSignal {
+        let ticks: Array1<u64> = (0..n)
+            .map(|i| i as u64 * 50_000 + if i > hole_at { gap_us } else { 0 })
+            .collect();
+        let iq = Array2::from_shape_fn((n, 1), |(i, _)| Complex::new(i as f64, 0.0));
+        CsiSignal::from_iq(iq, ticks).unwrap()
+    }
+
+    #[test]
+    fn resample_with_marks_a_regular_grid_observed() {
+        let signal = sine_signal(41, 1, 20.0, 1.0, 1.0);
+        let out = signal
+            .resample_with(20.0, InterpMethod::CubicSpline, ResampleOptions::default())
+            .unwrap();
+        // Jitter stays well under 1.5 nominal intervals, so nothing is bridged.
+        assert!(out.grid_state.iter().all(|s| *s == GridState::Observed));
+        assert_eq!(out.grid_state.len(), out.signal.n_samples());
+        assert!((out.nominal_interval_us - 50_000.0).abs() < 5_000.0);
+    }
+
+    #[test]
+    fn resample_without_threshold_bridges_every_gap() {
+        let signal = signal_with_gap(21, 10, 2_000_000); // 2 s hole
+        let out = signal
+            .resample_with(20.0, InterpMethod::Linear, ResampleOptions::default())
+            .unwrap();
+        assert!(out.grid_state.contains(&GridState::Bridged));
+        assert!(!out.grid_state.contains(&GridState::Masked));
+    }
+
+    #[test]
+    fn resample_masks_gaps_over_the_threshold_only() {
+        // 201 samples at 20 Hz (10 s) with a 400 ms hole after index 100.
+        let signal = signal_with_gap(201, 100, 400_000);
+        let out = signal
+            .resample_with(
+                20.0,
+                InterpMethod::Linear,
+                ResampleOptions {
+                    max_gap_us: Some(100_000),
+                },
+            )
+            .unwrap();
+        let masked = out
+            .grid_state
+            .iter()
+            .filter(|s| **s == GridState::Masked)
+            .count();
+        // 0.4 s at 20 Hz -> ~8 masked columns out of ~210.
+        assert!((5..=15).contains(&masked), "{masked} masked columns");
+        // The head of the record stays observed: a threshold must mask the
+        // hole, not the whole grid.
+        assert_eq!(out.grid_state[0], GridState::Observed);
+        assert_eq!(out.grid_state[10], GridState::Observed);
+    }
+
+    #[test]
+    fn masked_gap_does_not_distort_its_neighbours() {
+        // Same head data, wildly different data *after* the hole: the spline
+        // must not carry the far side into the near side.
+        let n = 21;
+        let hole_at = 10;
+        let build = |tail_scale: f64| {
+            let ticks: Array1<u64> = (0..n)
+                .map(|i| i as u64 * 50_000 + if i > hole_at { 2_000_000 } else { 0 })
+                .collect();
+            let iq = Array2::from_shape_fn((n, 1), |(i, _)| {
+                let v = if i <= hole_at {
+                    i as f64
+                } else {
+                    i as f64 * tail_scale
+                };
+                Complex::new(v, 0.0)
+            });
+            CsiSignal::from_iq(iq, ticks).unwrap()
+        };
+        let options = ResampleOptions {
+            max_gap_us: Some(100_000),
+        };
+        let a = build(1.0)
+            .resample_with(20.0, InterpMethod::CubicSpline, options)
+            .unwrap();
+        let b = build(500.0)
+            .resample_with(20.0, InterpMethod::CubicSpline, options)
+            .unwrap();
+        // Every column before the hole that is not masked must be identical.
+        let last_clean = a
+            .grid_state
+            .iter()
+            .position(|s| *s == GridState::Masked)
+            .unwrap();
+        for j in 0..last_clean {
+            assert!(
+                (a.signal.amplitude[[j, 0]] - b.signal.amplitude[[j, 0]]).abs() < 1e-9,
+                "column {j} leaked across the masked gap"
+            );
+        }
+    }
+
+    #[test]
+    fn no_threshold_matches_the_plain_resample() {
+        let signal = sine_signal(41, 3, 20.0, 2.0, 1.0);
+        let plain = signal.resample(100.0, InterpMethod::CubicSpline).unwrap();
+        let with = signal
+            .resample_with(100.0, InterpMethod::CubicSpline, ResampleOptions::default())
+            .unwrap();
+        assert_eq!(plain.n_samples(), with.signal.n_samples());
+        assert_eq!(plain.ticks_us, with.signal.ticks_us);
+        for i in 0..plain.n_samples() {
+            for k in 0..plain.n_subcarriers() {
+                assert_eq!(plain.amplitude[[i, k]], with.signal.amplitude[[i, k]]);
+                assert_eq!(plain.phase[[i, k]], with.signal.phase[[i, k]]);
+            }
+        }
+    }
+
+    #[test]
+    fn resample_with_carries_null_bins() {
+        let mut signal = sine_signal(11, 3, 20.0, 1.0, 1.0);
+        signal.null_bins = vec![0, 2];
+        let out = signal
+            .resample_with(20.0, InterpMethod::Linear, ResampleOptions::default())
+            .unwrap();
+        assert_eq!(out.signal.null_bins, vec![0, 2]);
+    }
+
+    #[test]
+    fn segment_ranges_split_only_on_over_threshold_gaps() {
+        let t = vec![0.0, 0.5, 1.0, 4.0, 4.5, 5.0];
+        // 3 s hole between index 2 and 3.
+        assert_eq!(segment_ranges(&t, 1.0), vec![(0, 2), (3, 5)]);
+        // Threshold above the hole: one segment.
+        assert_eq!(segment_ranges(&t, 10.0), vec![(0, 5)]);
+        // Threshold below every gap: every sample is its own segment (a
+        // zero-length segment is just that sample).
+        assert_eq!(
+            segment_ranges(&t, 0.1),
+            vec![(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]
+        );
+    }
+
+    #[test]
+    fn interp_method_names_match_the_payload() {
+        assert_eq!(InterpMethod::Nearest.as_str(), "nearest");
+        assert_eq!(InterpMethod::Linear.as_str(), "linear");
+        assert_eq!(InterpMethod::CubicSpline.as_str(), "cubic_spline");
+    }
+
+    #[test]
+    fn grid_state_wire_values() {
+        assert_eq!(GridState::Observed.as_u8(), 0);
+        assert_eq!(GridState::Bridged.as_u8(), 1);
+        assert_eq!(GridState::Masked.as_u8(), 2);
     }
 }

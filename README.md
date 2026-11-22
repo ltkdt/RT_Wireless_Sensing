@@ -24,16 +24,24 @@ Currently this is used for Wi-Fi CSI sensing.
     `bin/streaming.rs` — standalone CLIs for each module.
 - **Web** (`web/`): HTML5, CSS3, and Vanilla JavaScript with HTML Canvas 2D for
   interactive heatmap rendering.
-- **Python** (`scripts/`): creates plots and performs statistics to validate
-  CSI data.
-- **Samples** (`/samples`): some recorded samples, from both the current project and Espectre collection command
-- **Documentation** (`docs/`): per-module API and standalone-command reference.
+- **Samples** (`samples/`): a recorded V8 capture (`capture_v8.bin`) and the
+  dashboard HTML rendered from it (`capture_v8_heatmap.html`).
+- **Gallery** (`gallery/`): screenshots of the dashboard views, used by this
+  README.
+- **Documentation** (`docs_EN/`, `docs_VN/`): per-module API and
+  standalone-command reference, in English and Vietnamese.
+
+This project consumes ESPectre data in its own way: it owns the record schema,
+the decoder, the processing and the presentation. It does **not** use ESPectre's
+Python tooling or its plotting/statistics scripts — those are out of scope and
+are not part of this repository. Custom ESP32 firmware may be built here in the
+future.
 
 ## Modules
 
 | Module | Source | Functionality | Docs | Standalone command |
 |---|---|---|---|---|
-| **Collection** | `src/collection.rs` | Opens `/espectre/v1/csi`, sends UDP markers, and writes the raw byte stream to a `.bin` capture. | [docs_EN/collection.md](docs_EN/collection.md) | `cargo run --bin collect` |
+| **Collection** | `src/collection.rs` | Opens `/espectre/v1/csi`, sends UDP markers at a configurable PPS (Packet per Second) rate, and writes the raw byte stream to a `.bin` capture. | [docs_EN/collection.md](docs_EN/collection.md) | `cargo run --bin collect` |
 | **Decoder** | `src/decoder.rs` | Incrementally parses the 60-byte HTTP prefix and 64-byte V8 CSI header, validates counters, and exposes raw I/Q plus amplitude/phase. | [docs_EN/decoder.md](docs_EN/decoder.md) | `cargo run --bin decode -- capture_v8.bin` |
 | **Saving** | `src/saving.rs` | Decodes a collected `.bin` and writes a same-stem `.npz` with 1 timestamp + 64 amplitude + 64 phase arrays (129 total for 64 subcarriers). | [docs_EN/saving.md](docs_EN/saving.md) | `cargo run --bin save -- capture_v8.bin` |
 | **DSP** | `src/dsp/` | Synchronous signal processing over decoded CSI (`CsiSignal`): normalization, whole-record resampling, Hampel/median outlier removal, biquad LPF/HPF/BPF, FFT/STFT. Library only, no binary. | [docs_EN/dsp.md](docs_EN/dsp.md) | — |
@@ -70,9 +78,34 @@ decoder.
 
 ## Quick start
 
+Assuming the ESP32 device is flashed with ESpectre firmware, the ESP is connected to the same hotspot as the desktop, preferably if the desktop is also the hotspot. This is an example command to create AP on linux desktop:
+
+```
+sudo create_ap --ieee80211n --ieee80211ac --vht-chwidth 20 -c 149 wlan0 wlan0 your_ssid your_pass
+``` 
+
+Then, unside ESpectre folder, run:
+
 ```bash
+./espectre provision --ssid your_ssid
+```
+
+fill in the password, then ESpectre returns the endpoint:
+
+```
+Wi-Fi password (ESPECTRE_WIFI_PASSWORD is unset): 
+Improv provisioning completed.
+Device endpoint: http://192.168.12.253:62587/espectre/v1
+```
+
+This is the device IP needed to run the application:
+
+```bash
+# Decode and inspect the bundled sample capture (no device needed)
+cargo run --bin decode -- samples/capture_v8.bin --quiet
+
 # Record with the default device and output (same as `cargo run`)
-cargo run --bin collect -- --ip 10.178.22.9 --output capture_v8.bin --pps 100
+cargo run --bin collect -- --ip 10.178.22.9 --output capture_v8.bin --pps 100 --duration 5
 
 # Inspect the capture (optional)
 cargo run --bin decode -- capture_v8.bin --quiet
@@ -81,7 +114,7 @@ cargo run --bin decode -- capture_v8.bin --quiet
 cargo run --bin save -- capture_v8.bin
 
 # Visualize 2D amplitude heatmap (generates standalone capture_v8_heatmap.html)
-cargo run --bin visualize -- capture_v8.bin --open
+cargo run --bin visualize -- samples/capture_v8.bin --open
 
 # Collect and visualize live at the same time (open http://127.0.0.1:8080)
 cargo run --bin streaming -- --ip 10.178.22.9 --output capture_v8.bin --pps 100 --port 8080
@@ -90,13 +123,20 @@ cargo run --bin streaming -- --ip 10.178.22.9 --output capture_v8.bin --pps 100 
 python3 -c 'import numpy as np; d=np.load("capture_v8.npz"); print(len(d.files), d["timestamp_ms"].shape)'
 ```
 
-The repository's `capture_v8.bin` decodes to 691 records and produces
-`129` arrays of length `691`.
+The bundled sample `samples/capture_v8.bin` decodes to 501 records over 4.999 s
+at 100.01 records/s and produces `129` arrays of length `501`;
+`samples/capture_v8_heatmap.html` is the dashboard rendered from it. The file
+name follows the `capture_v8.bin` naming convention only — it is **not** the
+older 691-record capture that the integration tests still use (see
+[Tests](#tests)). It was recorded with a desktop machine acting as the access
+point (AP), as described in [Quick start](#quick-start).
 
 An example of the Web UI interface during streaming:
-![plot_ui](/gallery/example_UI.png)
-Inspecting records:
-![diagnostic_view](/gallery/diagnostic_view.png)
+![plot_ui](/gallery/main_ui.png)
+Inspecting the diagnostic view:
+![diagnostic_view](/gallery/diagnostic_view_panel.png)
+DSP view:
+![dsp_view](/gallery/dsp_view_panel.png)
 
 ## Documentation
 
@@ -121,8 +161,15 @@ cargo test --all-targets
 cargo clippy --all-targets
 ```
 
-The integration tests decode the real `capture_v8.bin` (691 frames, payload
-hash `0x6446fc78e2c7f3e6`) and verify the exported `.npz` layout and values.
+The integration tests decode an older reference capture (`capture_v8.bin`, 691
+frames, 34.5 s at 20 PPS, payload hash `0x6446fc78e2c7f3e6`) and verify the
+exported `.npz` layout and values. That file is not tracked; the tests expect it
+at the repository root, so copy the git-ignored copy into place first:
+
+```bash
+cp artifacts/capture_v8.bin .
+cargo test --all-targets
+```
 
 
 ---
@@ -150,9 +197,17 @@ nhận dạng hoạt động con người và định vị trong nhà. Hiện t�
     `bin/streaming.rs` — các CLI độc lập cho từng mô-đun.
 - **Web** (`web/`): HTML5, CSS3, và Vanilla JavaScript với HTML Canvas 2D để
   render heatmap tương tác.
-- **Python** (`scripts/`): tạo biểu đồ và thực hiện thống kê để xác thực
-  dữ liệu CSI.
-- **Tài liệu** (`docs_EN/`): API theo mô-đun và tham chiếu lệnh độc lập.
+- **Mẫu** (`samples/`): một bản ghi V8 (`capture_v8.bin`) và trang HTML dashboard
+  được render từ nó (`capture_v8_heatmap.html`).
+- **Gallery** (`gallery/`): ảnh chụp các chế độ xem của dashboard, dùng cho README này.
+- **Tài liệu** (`docs_EN/`, `docs_VN/`): API theo mô-đun và tham chiếu lệnh độc lập,
+  bằng tiếng Anh và tiếng Việt.
+
+Dự án này sử dụng dữ liệu của ESPectre theo cách riêng: nó tự quản lý schema bản
+ghi, bộ giải mã, phần xử lý và phần hiển thị. Dự án **không** dùng bộ công cụ
+Python của ESPectre hay các script vẽ biểu đồ/thống kê của ESPectre — những thứ
+đó nằm ngoài phạm vi và không thuộc kho lưu trữ này. Firmware ESP32 tùy biến có
+thể được xây dựng tại đây trong tương lai.
 
 ## Mô-đun
 
@@ -194,6 +249,9 @@ Schema bản ghi V8 chung ở `src/csi_header.rs` và được tài liệu hóa 
 ## Bắt đầu nhanh
 
 ```bash
+# Giải mã và kiểm tra bản ghi mẫu có sẵn (không cần thiết bị)
+cargo run --bin decode -- samples/capture_v8.bin --quiet
+
 # Ghi với thiết bị và đầu ra mặc định (giống với `cargo run`)
 cargo run --bin collect -- --ip 10.178.22.9 --output capture_v8.bin --pps 100
 
@@ -204,7 +262,7 @@ cargo run --bin decode -- capture_v8.bin --quiet
 cargo run --bin save -- capture_v8.bin
 
 # Hiển thị heatmap biên độ 2D (tạo capture_v8_heatmap.html độc lập)
-cargo run --bin visualize -- capture_v8.bin --open
+cargo run --bin visualize -- samples/capture_v8.bin --open
 
 # Thu thập và hiển thị trực tiếp cùng lúc (mở http://127.0.0.1:8080)
 cargo run --bin streaming -- --ip 10.178.22.9 --output capture_v8.bin --pps 100 --port 8080
@@ -213,11 +271,20 @@ cargo run --bin streaming -- --ip 10.178.22.9 --output capture_v8.bin --pps 100 
 python3 -c 'import numpy as np; d=np.load("capture_v8.npz"); print(len(d.files), d["timestamp_ms"].shape)'
 ```
 
-Tệp `capture_v8.bin` của kho lưu trữ giải mã thành 691 bản ghi và sản xuất
-`129` mảng có độ dài `691`.
+Bản ghi mẫu có sẵn `samples/capture_v8.bin` giải mã thành 501 bản ghi trong
+4.999 s với 100.01 bản ghi/s và tạo ra `129` mảng có độ dài `501`;
+`samples/capture_v8_heatmap.html` là dashboard render từ bản ghi đó. Tên tệp chỉ
+theo quy ước đặt tên `capture_v8.bin` — đây **không phải** bản ghi 691 bản ghi cũ
+mà các kiểm tra tích hợp vẫn dùng (xem [Kiểm tra](#kiểm-tra)). Bản ghi này được
+thu với máy tính để bàn đóng vai trò access point (AP), như mô tả ở
+[Bắt đầu nhanh](#bắt-đầu-nhanh).
 
 Một ví dụ về giao diện UI Web trong quá trình phát trực tuyến:
-![plot_ui](/plot_data/example_UI.png)
+![plot_ui](/gallery/main_ui.png)
+Xem chế độ chẩn đoán:
+![diagnostic_view](/gallery/diagnostic_view_panel.png)
+Chế độ DSP:
+![dsp_view](/gallery/dsp_view_panel.png)
 
 ## Tài liệu
 
@@ -242,8 +309,16 @@ cargo test --all-targets
 cargo clippy --all-targets
 ```
 
-Các kiểm tra tích hợp giải mã tệp `capture_v8.bin` thật (691 khung, hash payload
-`0x6446fc78e2c7f3e6`) và xác minh bố cục và giá trị của tệp `.npz` đã xuất.
+Các kiểm tra tích hợp giải mã một bản ghi tham chiếu cũ (`capture_v8.bin`, 691
+khung, 34.5 s ở 20 PPS, hash payload `0x6446fc78e2c7f3e6`) và xác minh bố cục và
+giá trị của tệp `.npz` đã xuất. Tệp này không được theo dõi trong git; các kiểm
+tra tìm nó ở thư mục gốc của kho lưu trữ, nên hãy chép bản trong `artifacts/`
+(git-ignored) vào trước:
+
+```bash
+cp artifacts/capture_v8.bin .
+cargo test --all-targets
+```
 
 ---
 

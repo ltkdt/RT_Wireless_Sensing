@@ -18,8 +18,9 @@ use rt_wireless_sensing::{
         CsiPacket, HTTP_FRAME_PREFIX_LEN_U16, HttpFrameHeader, RAW_CSI_PROTOCOL_VERSION,
         RAW_CSI_RESPONSE_MAGIC, SESSION_ID_LEN,
     },
+    dsp::NormScheme,
     visualization::{
-        VisualizationData, VisualizationError, VisualizationOptions,
+        DspOptions, VisualizationData, VisualizationError, VisualizationOptions,
         prepare_visualization_data_with_options,
     },
 };
@@ -133,7 +134,11 @@ fn diagnostics_are_attached_and_old_payloads_still_parse() {
         .expect("the diagnostic trace is attached");
     assert_eq!(
         diagnostics.slots_per_second,
-        data.metadata.nominal_pps.round().max(1.0) as usize
+        data.metadata
+            .nominal_pps
+            .unwrap_or(data.metadata.effective_pps)
+            .round()
+            .max(1.0) as usize
     );
     assert_eq!(diagnostics.origin_ticks, data.metadata.start_time_us);
     assert!(diagnostics.capture_end);
@@ -264,6 +269,9 @@ fn prepare_with(
             nominal_pps: Some(pps),
             capture_end: true,
             diagnostics,
+            // The synthetic fixtures are tiny; the DSP view is exercised by its
+            // own tests below.
+            dsp: None,
         },
     )
     .expect("synthetic stream should prepare")
@@ -295,6 +303,7 @@ fn diagnostic_trace_is_optional() {
             nominal_pps: Some(100.0),
             capture_end: true,
             diagnostics: false,
+            dsp: None,
         },
     )
     .expect("synthetic stream should prepare");
@@ -323,6 +332,239 @@ fn diagnostic_trace_is_optional() {
     assert_eq!(without.timestamps, with_defaults.timestamps);
     assert_eq!(without.amplitudes, with_defaults.amplitudes);
     assert_eq!(without.metadata, with_defaults.metadata);
+}
+
+/// `--no-dsp`: the block is absent but the base payload is untouched.
+#[test]
+fn dsp_view_is_optional() {
+    let origin = 5_000_000;
+    let samples: Vec<Sample> = (0..40)
+        .map(|i| Sample::new(1, origin + i * 50_000))
+        .collect();
+    let packets: Vec<CsiPacket> = samples.iter().copied().map(packet).collect();
+
+    let build = |dsp| {
+        prepare_visualization_data_with_options(
+            &packets,
+            Some("synthetic"),
+            origin,
+            VisualizationOptions {
+                nominal_pps: Some(20.0),
+                capture_end: true,
+                diagnostics: false,
+                dsp,
+            },
+        )
+        .expect("synthetic stream should prepare")
+    };
+
+    let without = build(None);
+    assert!(without.dsp.is_none());
+    assert!(
+        serde_json::to_string(&without)
+            .expect("serialize")
+            .contains("\"dsp\":null"),
+        "an absent DSP view must serialize as null so the web layer hides the toggle"
+    );
+
+    let with = build(Some(DspOptions::default()));
+    let dsp = with.dsp.as_ref().expect("dsp view");
+    assert_eq!(with.timestamps, without.timestamps);
+    assert_eq!(with.amplitudes, without.amplitudes);
+    assert_eq!(with.metadata, without.metadata);
+    assert_eq!(dsp.target_fs, 20.0);
+    assert_eq!(dsp.interp, "cubic_spline");
+    assert_eq!(dsp.norm, None);
+    assert_eq!(dsp.max_gap_ms, None);
+    assert_eq!(dsp.panels.len(), 2);
+    assert_eq!(dsp.panels[0].id, "amplitude");
+    assert_eq!(dsp.panels[1].id, "phase");
+}
+
+/// The DSP grid is the diagnostic slot grid: column `j` is `(j / N, j % N)`.
+#[test]
+fn dsp_grid_matches_slot_grid_on_capture() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let data =
+        VisualizationData::from_file_with_pps(&root.join("capture_v8.bin"), Some(100.0))
+            .expect("decode");
+    let trace = data.diagnostics.as_ref().expect("trace");
+    let dsp = data.dsp.as_ref().expect("dsp view");
+
+    let slots = trace.slots_per_second;
+    assert_eq!(slots, 100);
+    assert!((dsp.target_fs - slots as f64).abs() < 1e-9);
+
+    // Grid columns are uniform at 1/target_fs and span the capture.
+    assert!(dsp.timestamps.len() > 3_000);
+    for w in dsp.timestamps.windows(2) {
+        assert!((w[1] - w[0] - 1.0 / dsp.target_fs).abs() < 1e-9);
+    }
+    assert!((dsp.timestamps[0] - data.timestamps[0]).abs() < 1e-9);
+
+    // Column j maps to (second, slot) = (j / N, j % N), which must be a
+    // non-decreasing pair across the grid.
+    let mut previous = (0usize, 0usize);
+    for (j, _) in dsp.timestamps.iter().enumerate().step_by(97) {
+        let key = (j / slots, j % slots);
+        assert!(
+            key.0 > previous.0 || (key.0 == previous.0 && key.1 >= previous.1),
+            "column {j} broke slot order: {key:?} after {previous:?}"
+        );
+        previous = key;
+    }
+
+    // Every panel has the grid shape and no value is NaN (no masked columns
+    // in this capture with the default options).
+    assert_eq!(dsp.time_state.len(), dsp.timestamps.len());
+    for panel in &dsp.panels {
+        assert_eq!(panel.data.len(), dsp.timestamps.len());
+        for row in &panel.data {
+            assert_eq!(row.len(), data.metadata.subcarriers);
+            assert!(row.iter().all(|v| v.is_finite()));
+        }
+    }
+
+    // Phase is a real angle, not a placeholder: inside ±π with variation.
+    let phase = &dsp.panels[1].data;
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for row in phase {
+        for value in row {
+            assert!(*value >= -std::f32::consts::PI - 1e-5 && *value <= std::f32::consts::PI + 1e-5);
+            min = min.min(*value);
+            max = max.max(*value);
+        }
+    }
+    assert!(max - min > 0.1, "phase is constant: {min}..{max}");
+}
+
+/// The null-bin table on a real 64-subcarrier capture is exactly HT20's.
+#[test]
+fn dsp_null_bins_on_capture_are_the_ht20_table() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let data =
+        VisualizationData::from_file_with_pps(&root.join("capture_v8.bin"), Some(100.0))
+            .expect("decode");
+    let dsp = data.dsp.as_ref().expect("dsp view");
+    assert_eq!(dsp.null_subcarriers, vec![0, 1, 2, 3, 32, 61, 62, 63]);
+}
+
+/// A normalization adds the third panel and leaves the resampled pair intact.
+#[test]
+fn dsp_normalization_adds_a_panel() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let plain =
+        VisualizationData::from_file_with_pps(&root.join("capture_v8.bin"), Some(100.0))
+            .expect("decode");
+    let base = plain.dsp.as_ref().expect("dsp view");
+
+    let bytes = fs::read(root.join("capture_v8.bin")).expect("read capture");
+    let normalized = VisualizationData::from_bytes_with_options(
+        &bytes,
+        Some("capture_v8.bin"),
+        VisualizationOptions {
+            nominal_pps: Some(100.0),
+            diagnostics: false,
+            dsp: Some(DspOptions {
+                norm: Some(NormScheme::PerSample),
+                ..DspOptions::default()
+            }),
+            ..VisualizationOptions::default()
+        },
+    )
+    .expect("prepare");
+    let dsp = normalized.dsp.as_ref().expect("dsp view");
+    assert_eq!(dsp.norm.as_deref(), Some("per_sample"));
+    assert_eq!(dsp.panels.len(), 3);
+    assert_eq!(dsp.panels[0].id, "amplitude");
+    assert_eq!(dsp.panels[1].id, "phase");
+    let norm = &dsp.panels[2];
+    assert_eq!(norm.id, "amplitude_norm");
+    assert_eq!(norm.kind, "diverging");
+
+    // The base panels are unchanged by the normalization.
+    assert_eq!(base.panels[0].data, dsp.panels[0].data);
+    assert_eq!(base.panels[1].data, dsp.panels[1].data);
+
+    // Null subcarriers are zero in the normalized matrix.
+    let null = &dsp.null_subcarriers;
+    for row in &norm.data {
+        for k in null {
+            assert_eq!(row[*k], 0.0);
+        }
+    }
+}
+
+/// A gap threshold masks columns instead of fabricating values there, while a
+/// gap under the threshold is reported as bridged.
+#[test]
+fn dsp_max_gap_masks_columns() {
+    let origin = 5_000_000;
+    // 80 samples at 50 ms with two holes: 0.3 s after index 20 (over the
+    // 200 ms threshold -> masked) and 0.15 s after index 60 (over the
+    // ~1.5 x 50 ms bridging limit, under the threshold -> bridged). The grid
+    // runs at 100 Hz, so both holes span several columns. Values are explicit
+    // so the expectation stays readable.
+    let samples: Vec<Sample> = (0..80u64)
+        .map(|i| {
+            let mut offset = 0u64;
+            if i > 20 {
+                offset += 300_000;
+            }
+            if i > 60 {
+                offset += 100_000;
+            }
+            Sample::new(1, origin + i * 50_000 + offset)
+        })
+        .collect();
+    let packets: Vec<CsiPacket> = samples.iter().copied().map(packet).collect();
+
+    let data = prepare_visualization_data_with_options(
+        &packets,
+        Some("synthetic"),
+        origin,
+        VisualizationOptions {
+            nominal_pps: Some(100.0),
+            capture_end: true,
+            diagnostics: false,
+            dsp: Some(DspOptions {
+                max_gap_ms: Some(200.0),
+                ..DspOptions::default()
+            }),
+        },
+    )
+    .expect("prepare");
+    let dsp = data.dsp.as_ref().expect("dsp view");
+    assert_eq!(dsp.max_gap_ms, Some(200.0));
+
+    let masked: Vec<usize> = dsp
+        .time_state
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| **state == 2)
+        .map(|(j, _)| j)
+        .collect();
+    let bridged: Vec<usize> = dsp
+        .time_state
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| **state == 1)
+        .map(|(j, _)| j)
+        .collect();
+    assert!(!masked.is_empty(), "the 0.3 s hole must mask columns");
+    assert!(!bridged.is_empty(), "the 0.15 s hole must be bridged: {:?}", dsp.time_state);
+    // The masked hole comes first in time, the bridged one after it.
+    assert!(*masked.last().unwrap() < *bridged.first().unwrap());
+
+    // Masked cells are withheld (NaN) rather than presented as values; the
+    // bridged column itself carries an interpolated value.
+    for j in &masked {
+        assert!(dsp.panels[0].data[*j].iter().all(|v| v.is_nan()));
+    }
+    assert!(dsp.panels[0].data[bridged[0]].iter().all(|v| v.is_finite()));
+    // Untouched head columns stay finite.
+    assert!(dsp.panels[0].data[0].iter().all(|v| v.is_finite()));
 }
 
 #[test]
@@ -376,7 +618,7 @@ fn explicit_pps_keeps_the_slot_grid_at_the_configured_rate() {
     let measured = VisualizationData::from_file(&input).expect("decode");
     let configured = VisualizationData::from_file_with_pps(&input, Some(100.0)).expect("decode");
 
-    assert_eq!(configured.metadata.nominal_pps, 100.0);
+    assert_eq!(configured.metadata.nominal_pps, Some(100.0));
     let trace = configured.diagnostics.as_ref().expect("trace");
     assert_eq!(trace.slots_per_second, 100);
 

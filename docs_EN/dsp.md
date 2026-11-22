@@ -30,8 +30,19 @@ pub struct CsiSignal {
     pub ticks_us: Array1<u64>,               // device_ticks_us, non-decreasing
     pub fs: f64,                             // nominal sample rate, Hz
     pub iq: Option<Array2<Complex<f64>>>,    // h_k(t) = I + jQ when available
+    pub null_bins: Vec<usize>,               // subcarrier indices with no energy
 }
 ```
+
+`null_bins` lists the subcarriers the standard defines as unused — for the
+HT20 preamble these are the DC bin (32), the three guard bins on each edge
+(0–3 and 61–63), giving 8 null bins out of 64. They carry no channel
+information: amplitude is a hardware artefact, phase is meaningless noise.
+Downstream code skips them whenever a statistic is computed across
+subcarriers. `from_packets` fills the list with `null_bins_for(n_subcarriers)`,
+which returns the HT20 table when `n_subcarriers == HT20_SUBCARRIERS` (64) and
+an empty list otherwise — a different standard needs a different table, so the
+list lives in one place instead of being hard-coded per call site.
 
 For subcarrier $k$ at sample $t$, with $h_k(t) = I_k(t) + j\,Q_k(t)$:
 
@@ -94,6 +105,14 @@ The epsilon guard $\varepsilon = 10^{-12}$ keeps constant (zero-variance)
 subcarriers finite instead of dividing by zero. Only `amplitude` is
 transformed; phase, ticks, `fs`, and the complex view stay consistent.
 
+**Null subcarriers are excluded from every statistic.** `PerSubcarrier` and
+`MinMax` skip the null columns when computing $\mu_k, \sigma_k, \min_k, \max_k$
+and leave those columns at 0. `PerSample` computes the single global $\mu,
+\sigma$ over the non-null values only, then writes 0 into the null columns.
+Scoring them would let the near-zero guard bins drag the mean down and dilute
+the variance for every real subcarrier. With an empty `null_bins` the output is
+bit-identical to the plain implementation.
+
 ### `csi_ratio` (optional)
 
 Conjugate product per subcarrier — the standard phase-insensitive
@@ -126,6 +145,42 @@ The cubic spline is hand-rolled (~40 lines, unit-tested against analytic
 curves): no maintained crate evaluates a *non-uniform* natural cubic spline —
 the `splines` crate's Catmull-Rom requires uniform spacing, which jittered
 device ticks violate.
+
+### Gap handling — `resample_with`
+
+`resample()` is a thin wrapper over `resample_with(target_fs, method, options)`,
+the single implementation. The `options` variant additionally reports *how*
+each grid point was produced:
+
+```rust
+pub struct ResampleOptions { pub max_gap_us: Option<u64> }
+pub struct ResampleOutput {
+    pub signal: CsiSignal,
+    pub grid_state: Vec<GridState>,        // one entry per grid column
+    pub nominal_interval_us: f64,
+}
+pub enum GridState { Observed = 0, Bridged = 1, Masked = 2 }
+```
+
+A dropout longer than one sample interval is not a signal feature, so the
+source is **split into segments at every over-threshold gap** and each segment
+is interpolated independently; adjacent segments share their boundary sample so
+no data is lost. A grid column is only written when it falls inside a segment —
+the gap itself is never extrapolated across, which is what prevents a spline
+from inventing a smooth bridge over a 250 ms dropout.
+
+Each written column is then classified against `nominal_interval_us` (the median
+source interval):
+
+| `GridState` | Condition | Meaning |
+|---|---|---|
+| `Observed` | source gap $\le 1.5 \times$ median interval | real data, only interpolated for jitter |
+| `Bridged` | between the 1.5× limit and `max_gap_us` | interpolated across a genuine dropout — plausible but reconstructed |
+| `Masked` | gap $> $ `max_gap_us` | withheld: too long to trust, flagged for analysis |
+
+With `max_gap_us == None` nothing is masked, but `Observed`/`Bridged` are still
+distinguished. Downstream consumers render `Masked` as NaN (or an empty CSV
+cell) rather than as a number, so a visible hole never looks like a measurement.
 
 ## Spectral analysis — `src/dsp/spectral.rs`
 

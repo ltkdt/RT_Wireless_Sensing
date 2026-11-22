@@ -30,8 +30,19 @@ pub struct CsiSignal {
     pub ticks_us: Array1<u64>,               // device_ticks_us, không giảm
     pub fs: f64,                             // tốc độ lấy mẫu danh nghĩa, Hz
     pub iq: Option<Array2<Complex<f64>>>,    // h_k(t) = I + jQ nếu có
+    pub null_bins: Vec<usize>,               // chỉ số subcarrier không mang năng lượng
 }
 ```
+
+`null_bins` liệt kê các subcarrier mà chuẩn quy định là không dùng — với
+preamble HT20 là bin DC (32), ba bin bảo vệ ở mỗi biên (0–3 và 61–63), tổng
+cộng 8 bin null trên 64. Chúng không mang thông tin kênh: biên độ chỉ là hiện
+tượng phần cứng, còn pha là nhiễu vô nghĩa. Mọi đoạn mã phía sau đều bỏ qua các
+bin này khi tính thống kê theo trục subcarrier. `from_packets` điền danh sách
+bằng `null_bins_for(n_subcarriers)`, trả về bảng HT20 khi
+`n_subcarriers == HT20_SUBCARRIERS` (64) và danh sách rỗng trong trường hợp
+khác — một chuẩn khác cần bảng khác, nên bảng chỉ nằm ở một nơi thay vì bị
+hard-code tại từng chỗ gọi.
 
 Với subcarrier $k$ tại mẫu $t$, đặt $h_k(t) = I_k(t) + j\,Q_k(t)$:
 
@@ -93,6 +104,13 @@ Hằng số bảo vệ $\varepsilon = 10^{-12}$ giữ cho subcarrier hằng số
 bằng không) hữu hạn thay vì chia cho không. Chỉ `amplitude` bị biến đổi; pha,
 ticks, `fs` và khung nhìn phức vẫn nhất quán.
 
+**Subcarrier null bị loại khỏi mọi thống kê.** `PerSubcarrier` và `MinMax` bỏ
+qua các cột null khi tính $\mu_k, \sigma_k, \min_k, \max_k$ và để các cột đó
+bằng 0. `PerSample` tính $\mu, \sigma$ chung trên các giá trị không null, rồi
+ghi 0 vào các cột null. Nếu tính cả chúng, các bin bảo vệ gần 0 sẽ kéo trung
+bình xuống và làm loãng phương sai của mọi subcarrier thật. Với `null_bins`
+rỗng, kết quả giống hệt từng bit so với bản không có xử lý null.
+
 ### `csi_ratio` (tùy chọn)
 
 Tích liên hợp theo subcarrier — tiền xử lý nhạy pha chuẩn trên nền ESP32. Độ
@@ -123,6 +141,43 @@ Spline bậc ba được viết tay (~40 dòng, kiểm thử bằng đường co
 crate nào được bảo trì mà đánh giá spline bậc ba tự nhiên **không đều** —
 Catmull-Rom của crate `splines` đòi hỏi khoảng cách đều, trong khi tick của
 thiết bị bị jitter.
+
+### Xử lý khoảng trống — `resample_with`
+
+`resample()` chỉ là lớp bọc mỏng quanh `resample_with(target_fs, method,
+options)` — bản triển khai duy nhất. Biến thể có `options` báo cáo thêm **cách**
+mỗi điểm lưới được tạo ra:
+
+```rust
+pub struct ResampleOptions { pub max_gap_us: Option<u64> }
+pub struct ResampleOutput {
+    pub signal: CsiSignal,
+    pub grid_state: Vec<GridState>,        // một phần tử cho mỗi cột lưới
+    pub nominal_interval_us: f64,
+}
+pub enum GridState { Observed = 0, Bridged = 1, Masked = 2 }
+```
+
+Một khoảng mất dữ liệu dài hơn một chu kỳ lấy mẫu không phải là đặc trưng tín
+hiệu, nên nguồn được **chia thành các đoạn tại mỗi khoảng trống vượt ngưỡng** và
+mỗi đoạn được nội suy độc lập; hai đoạn kề nhau dùng chung mẫu biên nên không
+mất dữ liệu. Cột lưới chỉ được ghi khi nó nằm trong một đoạn — khoảng trống
+không bao giờ bị ngoại suy, đó chính là điều ngăn spline tự vẽ một cầu nối mượt
+qua chỗ mất 250 ms.
+
+Mỗi cột được ghi sau đó được phân loại theo `nominal_interval_us` (trung vị chu
+kỳ nguồn):
+
+| `GridState` | Điều kiện | Ý nghĩa |
+|---|---|---|
+| `Observed` | khoảng nguồn $\le 1.5 \times$ trung vị | dữ liệu thật, chỉ nội suy do jitter |
+| `Bridged` | giữa ngưỡng 1.5× và `max_gap_us` | nội suy qua chỗ mất mát thật — hợp lý nhưng là dữ liệu dựng lại |
+| `Masked` | khoảng $> $ `max_gap_us` | bị che: quá dài để tin, được đánh dấu cho phân tích |
+
+Với `max_gap_us == None` không cột nào bị che, nhưng `Observed`/`Bridged` vẫn
+được phân biệt. Phía tiêu thụ hiển thị `Masked` dưới dạng NaN (hoặc ô CSV rỗng)
+thay vì một con số, để một lỗ hổng nhìn thấy được không bao giờ trông giống một
+phép đo.
 
 ## Phân tích phổ — `src/dsp/spectral.rs`
 

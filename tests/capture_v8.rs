@@ -1,15 +1,18 @@
-//! End-to-end tests against the real ESPectre capture.
+//! End-to-end tests against a real ESPectre capture.
 //!
-//! `capture_v8.bin` was recorded from an ESP32-C5 at 20 PPS and validated with
-//! ESPectre's Python reference parser. These tests lock in the whole-file
-//! result so a change to the decoder cannot silently alter record boundaries,
-//! counters, or the raw I/Q payload.
+//! The fixture is the **legacy** `capture_v8.bin` (691 records, 34.5 s at
+//! 20 PPS, recorded from an ESP32-C5, validated against ESPectre's Python
+//! reference parser), read from the repository root. It is **not** the current
+//! sample in `samples/capture_v8.bin` (501 records, 100 PPS, desktop-as-AP):
+//! the two only share the file name, by naming convention. These tests lock in
+//! the whole-file result so a change to the decoder cannot silently alter record
+//! boundaries, counters, or the raw I/Q payload.
 
 use std::{fs, path::Path};
 
 use rt_wireless_sensing::decoder::{CsiPacket, FrameStreamDecoder};
 
-/// Load and fully decode `capture_v8.bin`.
+/// Load and fully decode the legacy `capture_v8.bin` at the repository root.
 fn decode_capture() -> Vec<CsiPacket> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("capture_v8.bin");
     let bytes = fs::read(&path).expect("capture_v8.bin should exist");
