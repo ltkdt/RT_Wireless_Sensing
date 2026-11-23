@@ -6,7 +6,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::PathBuf,
 };
 
 use rt_wireless_sensing::{
@@ -27,22 +26,21 @@ use rt_wireless_sensing::{
 
 #[test]
 fn capture_decodes_into_visualization_matrix() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let input = root.join("capture_v8.bin");
+    let input = rt_wireless_sensing::fixtures::capture_v8();
 
     let data = VisualizationData::from_file(&input).expect("should decode capture_v8.bin");
 
     // 1. Verify Metadata
-    assert_eq!(data.metadata.total_frames, 691);
+    assert_eq!(data.metadata.total_frames, 501);
     assert_eq!(data.metadata.subcarriers, 64);
     assert_eq!(data.metadata.title, "CSI Amplitude Heatmap");
-    assert!((data.metadata.duration_seconds - 34.499_075).abs() < 1e-4);
-    assert!((data.metadata.effective_pps - 20.00).abs() < 0.05);
+    assert!((data.metadata.duration_seconds - 4.999_419).abs() < 1e-4);
+    assert!((data.metadata.effective_pps - 100.01).abs() < 0.05);
 
     // 2. Verify Timestamps
-    assert_eq!(data.timestamps.len(), 691);
+    assert_eq!(data.timestamps.len(), 501);
     assert_eq!(data.timestamps[0], 0.0);
-    assert!((data.timestamps[690] - 34.499_075).abs() < 1e-4);
+    assert!((data.timestamps[500] - 4.999_419).abs() < 1e-4);
 
     // Monotonicity check
     for window in data.timestamps.windows(2) {
@@ -53,7 +51,7 @@ fn capture_decodes_into_visualization_matrix() {
     }
 
     // 3. Verify Amplitudes Matrix [N, 64]
-    assert_eq!(data.amplitudes.len(), 691);
+    assert_eq!(data.amplitudes.len(), 501);
     for row in &data.amplitudes {
         assert_eq!(row.len(), 64);
     }
@@ -63,32 +61,31 @@ fn capture_decodes_into_visualization_matrix() {
         assert_eq!(row[0], 0.0);
     }
 
-    // Subcarrier 4 is first live subcarrier: (I, Q) = (-20, 5), hypot ~ 20.6155
-    assert!((data.amplitudes[0][4] - 20.615_528).abs() < 1e-4);
+    // Subcarrier 4 is the first live subcarrier: raw (Q, I) = (-12, -20),
+    // so I = -20, Q = -12, hypot ~ 23.3238
+    assert!((data.amplitudes[0][4] - 23.323_808).abs() < 1e-4);
 }
 
 #[test]
 fn json_serialization_and_export() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let input = root.join("capture_v8.bin");
+    let input = rt_wireless_sensing::fixtures::capture_v8();
 
     let data = VisualizationData::from_file(&input).expect("should decode capture_v8.bin");
     let json_str = data.to_json().expect("should serialize to JSON");
 
     assert!(json_str.contains("\"title\":\"CSI Amplitude Heatmap\""));
-    assert!(json_str.contains("\"total_frames\":691"));
+    assert!(json_str.contains("\"total_frames\":501"));
     assert!(json_str.contains("\"subcarriers\":64"));
 
     // Verify round-trip parsing
     let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("JSON must be valid");
-    assert_eq!(parsed["metadata"]["total_frames"], 691);
-    assert_eq!(parsed["amplitudes"].as_array().unwrap().len(), 691);
+    assert_eq!(parsed["metadata"]["total_frames"], 501);
+    assert_eq!(parsed["amplitudes"].as_array().unwrap().len(), 501);
 }
 
 #[test]
 fn standalone_html_bundle_generation() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let input = root.join("capture_v8.bin");
+    let input = rt_wireless_sensing::fixtures::capture_v8();
     let temp_html = std::env::temp_dir().join(format!("test_heatmap_{}.html", std::process::id()));
 
     let data = VisualizationData::from_file(&input)
@@ -120,8 +117,7 @@ fn rejects_empty_input() {
 
 #[test]
 fn diagnostics_are_attached_and_old_payloads_still_parse() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let input = root.join("capture_v8.bin");
+    let input = rt_wireless_sensing::fixtures::capture_v8();
 
     let data = VisualizationData::from_file(&input).expect("should decode capture_v8.bin");
 
@@ -384,9 +380,8 @@ fn dsp_view_is_optional() {
 /// The DSP grid is the diagnostic slot grid: column `j` is `(j / N, j % N)`.
 #[test]
 fn dsp_grid_matches_slot_grid_on_capture() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let data =
-        VisualizationData::from_file_with_pps(&root.join("capture_v8.bin"), Some(100.0))
+        VisualizationData::from_file_with_pps(&rt_wireless_sensing::fixtures::capture_v8(), Some(100.0))
             .expect("decode");
     let trace = data.diagnostics.as_ref().expect("trace");
     let dsp = data.dsp.as_ref().expect("dsp view");
@@ -395,8 +390,16 @@ fn dsp_grid_matches_slot_grid_on_capture() {
     assert_eq!(slots, 100);
     assert!((dsp.target_fs - slots as f64).abs() < 1e-9);
 
-    // Grid columns are uniform at 1/target_fs and span the capture.
-    assert!(dsp.timestamps.len() > 3_000);
+    // Grid columns are uniform at 1/target_fs and span the capture: the grid
+    // must cover the whole duration at the requested rate, not just the
+    // measured one.
+    let expected_columns = (data.metadata.duration_seconds * slots as f64) as usize;
+    assert!(
+        dsp.timestamps.len() >= expected_columns,
+        "grid has {} columns, expected at least {expected_columns} for {:.3}s at {slots} Hz",
+        dsp.timestamps.len(),
+        data.metadata.duration_seconds
+    );
     for w in dsp.timestamps.windows(2) {
         assert!((w[1] - w[0] - 1.0 / dsp.target_fs).abs() < 1e-9);
     }
@@ -442,9 +445,8 @@ fn dsp_grid_matches_slot_grid_on_capture() {
 /// The null-bin table on a real 64-subcarrier capture is exactly HT20's.
 #[test]
 fn dsp_null_bins_on_capture_are_the_ht20_table() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let data =
-        VisualizationData::from_file_with_pps(&root.join("capture_v8.bin"), Some(100.0))
+        VisualizationData::from_file_with_pps(&rt_wireless_sensing::fixtures::capture_v8(), Some(100.0))
             .expect("decode");
     let dsp = data.dsp.as_ref().expect("dsp view");
     assert_eq!(dsp.null_subcarriers, vec![0, 1, 2, 3, 32, 61, 62, 63]);
@@ -453,13 +455,12 @@ fn dsp_null_bins_on_capture_are_the_ht20_table() {
 /// A normalization adds the third panel and leaves the resampled pair intact.
 #[test]
 fn dsp_normalization_adds_a_panel() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let plain =
-        VisualizationData::from_file_with_pps(&root.join("capture_v8.bin"), Some(100.0))
+        VisualizationData::from_file_with_pps(&rt_wireless_sensing::fixtures::capture_v8(), Some(100.0))
             .expect("decode");
     let base = plain.dsp.as_ref().expect("dsp view");
 
-    let bytes = fs::read(root.join("capture_v8.bin")).expect("read capture");
+    let bytes = fs::read(rt_wireless_sensing::fixtures::capture_v8()).expect("read capture");
     let normalized = VisualizationData::from_bytes_with_options(
         &bytes,
         Some("capture_v8.bin"),
@@ -569,8 +570,7 @@ fn dsp_max_gap_masks_columns() {
 
 #[test]
 fn diagnostic_grid_agrees_with_occupancy_on_capture() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let data = VisualizationData::from_file(&root.join("capture_v8.bin")).expect("decode");
+    let data = VisualizationData::from_file(&rt_wireless_sensing::fixtures::capture_v8()).expect("decode");
     let trace = data.diagnostics.as_ref().expect("trace");
     let slots = trace.slots_per_second;
 
@@ -612,29 +612,40 @@ fn diagnostic_grid_agrees_with_occupancy_on_capture() {
 
 #[test]
 fn explicit_pps_keeps_the_slot_grid_at_the_configured_rate() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let input = root.join("capture_v8.bin");
+    let input = rt_wireless_sensing::fixtures::capture_v8();
 
     let measured = VisualizationData::from_file(&input).expect("decode");
-    let configured = VisualizationData::from_file_with_pps(&input, Some(100.0)).expect("decode");
+    // The fixture runs at ~100 pps. Ask for 200 so the configured grid is
+    // provably *not* the measured rate: the same records are then spread over
+    // twice as many slots, leaving the odd ones empty.
+    let configured = VisualizationData::from_file_with_pps(&input, Some(200.0)).expect("decode");
 
-    assert_eq!(configured.metadata.nominal_pps, Some(100.0));
+    assert_eq!(configured.metadata.nominal_pps, Some(200.0));
     let trace = configured.diagnostics.as_ref().expect("trace");
-    assert_eq!(trace.slots_per_second, 100);
+    assert_eq!(trace.slots_per_second, 200);
 
-    // The capture runs at ~20 pps, so a full second fills about 20 of 100 slots
-    // instead of collapsing the grid to the measured rate.
+    // A full second holds 200 slots but only ~100 records, so about half the
+    // slots are filled. The point of the test is that the grid follows the
+    // configured rate instead of collapsing to the measured one.
     let full = trace
         .seconds
         .iter()
         .find(|stats| !stats.partial && stats.samples > 0)
         .expect("a full second");
-    assert_eq!(full.slots, 100);
-    assert!(full.filled_slots <= 21, "filled {}", full.filled_slots);
-    assert!(full.empty_slots >= 79, "empty {}", full.empty_slots);
+    assert_eq!(full.slots, 200);
+    assert!(
+        full.filled_slots <= 101,
+        "filled {} of 200",
+        full.filled_slots
+    );
+    assert!(
+        full.empty_slots >= 99,
+        "empty {} of 200",
+        full.empty_slots
+    );
 
     let measured_trace = measured.diagnostics.as_ref().expect("trace");
-    assert!(measured_trace.slots_per_second < 100);
+    assert!(measured_trace.slots_per_second < 200);
 }
 
 #[test]

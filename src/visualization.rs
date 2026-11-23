@@ -1739,11 +1739,11 @@ pub async fn serve_dashboard_live_on(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn capture_packets() -> Vec<CsiPacket> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("capture_v8.bin");
-        let bytes = std::fs::read(path).expect("capture_v8.bin should exist");
+        let path = crate::fixtures::capture_v8();
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("{} should exist: {error}", path.display()));
         decode_packets(&bytes).expect("capture should decode")
     }
 
@@ -1762,7 +1762,13 @@ mod tests {
         assert_eq!(data.metadata.nominal_pps, Some(20.0));
         assert_eq!(data.metadata.total_frames, window.len());
         assert!((data.timestamps[0] - expected).abs() < 1e-12);
-        assert!(data.timestamps[0] > 4.0);
+        // The window starts after the origin, so the offset must be applied
+        // rather than reset to zero. One record past 100 at ~100 PPS is ~1 s.
+        assert!(
+            data.timestamps[0] > 0.5,
+            "window offset not applied: {}",
+            data.timestamps[0]
+        );
     }
 
     #[test]
