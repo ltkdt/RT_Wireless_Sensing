@@ -181,9 +181,20 @@ class CsiVisualizer {
     // Requested (nominal) packets-per-second, i.e. the `--pps` argument.
     // Returns null when the payload carries no argument, so callers can show
     // the fallback instead of pretending it was requested.
+    //
+    // Only an `argument`-sourced nominal counts as "requested". In internal mode
+    // the nominal is usually the device's own `csi_target_pps`, which this
+    // client never asked for; calling it `--pps` would attribute a device
+    // setting to the operator. A payload without the field predates it, and
+    // there the number really was the argument.
     getRequestedPps() {
         const meta = this.data && this.data.metadata;
         if (!meta) return null;
+        if (meta.nominal_pps_source !== undefined
+            && meta.nominal_pps_source !== null
+            && meta.nominal_pps_source !== 'argument') {
+            return null;
+        }
         const configured = meta.nominal_pps;
         if (typeof configured === 'number' && Number.isFinite(configured) && configured > 0) {
             return configured;
@@ -191,14 +202,43 @@ class CsiVisualizer {
         return null;
     }
 
+    // Provenance of the nominal rate: 'device', 'argument', or null when the
+    // payload does not say. Only the hint text distinguishes them.
+    getNominalSource() {
+        const meta = this.data && this.data.metadata;
+        if (!meta) return null;
+        return meta.nominal_pps_source || null;
+    }
+
+    // Who produced the traffic: 'internal', 'external', or null when the
+    // payload does not say (an offline `visualize` of a file without the
+    // `_internal` suffix, for example).
+    getTrafficMode() {
+        const meta = this.data && this.data.metadata;
+        if (!meta) return null;
+        return meta.traffic_mode || null;
+    }
+
     // Nominal packets-per-second used to divide a one-second interval into
     // occupancy slots: the `--pps` argument when present, otherwise the
     // default rate. The measured rate is never used here — it is reported
     // separately as effective PPS.
+    //
+    // `nominal_pps` drives this whether it came from `--pps` or from the
+    // device, because it describes the cadence the slot grid should assume.
+    // getRequestedPps() is deliberately narrower: it answers "did the operator
+    // ask for this rate?", which is a different question.
     getNominalPps() {
         const requested = this.getRequestedPps();
-        const pps = Math.round(requested !== null ? requested : DEFAULT_NOMINAL_PPS);
-        return Math.max(1, Math.min(pps || 1, 100000));
+        if (requested !== null) {
+            return Math.max(1, Math.min(Math.round(requested) || 1, 100000));
+        }
+        const meta = this.data && this.data.metadata;
+        const declared = meta ? meta.nominal_pps : null;
+        const pps = typeof declared === 'number' && Number.isFinite(declared) && declared > 0
+            ? declared
+            : DEFAULT_NOMINAL_PPS;
+        return Math.max(1, Math.min(Math.round(pps) || 1, 100000));
     }
 
     // Subcarrier count per frame. Rust always sends metadata.subcarriers;
@@ -286,6 +326,28 @@ class CsiVisualizer {
         this.updateOccupancyUI();
     }
 
+    // The Packet Rate hint, as a pure function of (traffic_mode,
+    // nominal_pps_source). Each combination means something different, and the
+    // whole point of the Traffic row is that the reader must not have to guess
+    // which one they are looking at.
+    nominalHint(mode, source, nominal, hasArgument) {
+        if (mode === null) {
+            // Legacy or offline payload with no mode: today's wording, so an
+            // old file renders exactly as it did before this change.
+            return hasArgument
+                ? 'Requested --pps vs measured rate'
+                : `No --pps argument — default ${nominal} PPS`;
+        }
+        if (mode === 'internal') {
+            return source === 'device'
+                ? 'Device target PPS vs measured rate'
+                : '--pps fallback (device rate unavailable)';
+        }
+        return hasArgument
+            ? 'Requested --pps vs measured rate'
+            : `No --pps argument — default ${nominal} PPS`;
+    }
+
     updateMetadataUI() {
         if (!this.data || !this.data.metadata) return;
         const meta = this.data.metadata;
@@ -299,22 +361,54 @@ class CsiVisualizer {
         setElem('metaDuration', `${meta.duration_seconds.toFixed(2)} s`);
         setElem('metaFrames', `${meta.total_frames.toLocaleString()} frames`);
 
-        // Packet rate: the requested `--pps` argument (nominal) next to the
-        // rate actually measured from the device clock (effective).
+        // Traffic: who produces the packets. This is what makes the two numbers
+        // below readable — "100 PPS nominal" means "we drive 100" in external
+        // mode and "the device aims for 100" in internal mode.
+        const mode = this.getTrafficMode();
+        const source = this.getNominalSource();
+        const modeLabel = mode === 'internal' ? 'Internal' : mode === 'external' ? 'External' : '—';
+        setElem('metaTrafficMode', modeLabel);
+        const modeEl = document.getElementById('metaTrafficMode');
+        if (modeEl) {
+            modeEl.classList.toggle('metric-pair-default', mode === null);
+            modeEl.title = mode === 'internal'
+                ? 'the device generates its own traffic (traffic_generator_mode is not external)'
+                : mode === 'external'
+                    ? 'this host sends the UDP markers; the device sends nothing'
+                    : 'traffic mode unknown — this payload carries no traffic_mode (offline file without the _internal suffix)';
+        }
+
+        // Packet rate: the nominal cadence next to the rate actually measured
+        // from the device clock (effective).
         const requested = this.getRequestedPps();
         const hasArgument = requested !== null;
         const nominal = this.getNominalPps();
         setElem('metaNominalRate', `${nominal} PPS`);
-        setElem(
-            'metaNominalRateHint',
-            hasArgument ? 'Requested --pps vs measured rate' : `No --pps argument — default ${nominal} PPS`
-        );
+        setElem('metaNominalRateHint', this.nominalHint(mode, source, nominal, hasArgument));
+
         const nominalEl = document.getElementById('metaNominalRate');
         if (nominalEl) {
-            nominalEl.classList.toggle('metric-pair-default', !hasArgument);
-            nominalEl.title = hasArgument
-                ? `--pps ${nominal} (slot grid rate)`
-                : `--pps not supplied; DEFAULT_NOMINAL_PPS = ${nominal} is used for the slot grid`;
+            // Italic only when nothing declared the rate and the default is in
+            // use. A device-sourced rate is real, just not ours.
+            const isDefault = !hasArgument && source === null;
+            nominalEl.classList.toggle('metric-pair-default', isDefault);
+            nominalEl.title = source === 'device'
+                ? `device csi_target_pps = ${nominal} (drives the slot grid)`
+                : source === 'argument'
+                    ? `--pps ${nominal} (slot grid rate)`
+                    : `no nominal rate declared; DEFAULT_NOMINAL_PPS = ${nominal} is used for the slot grid`;
+        }
+        // The hint is a pure function of (mode, source), so it reads the same
+        // whether the fallback fired because the device read failed (live) or
+        // because an offline file never recorded the device's rate. The title
+        // says which, since only the payload's origin can tell them apart.
+        const hintEl = document.getElementById('metaNominalRateHint');
+        if (hintEl) {
+            hintEl.title = mode === 'internal' && source === 'argument'
+                ? 'internal mode, but this payload carries no device csi_target_pps: either '
+                  + 'the device could not be read (live run) or the capture predates it '
+                  + '(offline file), so --pps is the nominal instead'
+                : '';
         }
         setElem(
             'metaRate',
@@ -809,6 +903,13 @@ class CsiVisualizer {
 // columns render hatched gray.
 
 // Empty-slot causes, as serialized by `DiagnosticCause` in Rust.
+//
+// `generator_missed` is the one cause whose attribution depends on who produced
+// the traffic, so its label and layer are the defaults for external/unknown
+// mode and are overridden for internal mode by `causeLabel()` / `causeLayer()`
+// below. Mirrors `layer_for()` in `visualization.rs`: the classification and the
+// evidence (zero Δdrop, zero dropped frames) are identical in both modes; only
+// the blame moves, because in internal mode the generator *is* the device.
 const CAUSE_LABELS = {
     device_drop: 'dropped at the device stream layer — RX (device)',
     desktop_backpressure: 'the desktop did not accept the batch — desktop reads too slowly',
@@ -824,6 +925,32 @@ const CAUSE_LAYERS = {
     generator_missed: 'generator',
     ambiguous: ''
 };
+
+// Internal-mode overrides. Only `generator_missed` has one.
+const CAUSE_LABELS_INTERNAL = {
+    generator_missed: 'no record generated — device generator or firmware'
+};
+
+const CAUSE_LAYERS_INTERNAL = {
+    generator_missed: 'rx'
+};
+
+// Label for a cause, given the payload's traffic mode. `mode` is 'internal',
+// 'external', or null when unknown.
+function causeLabel(cause, mode) {
+    if (mode === 'internal' && CAUSE_LABELS_INTERNAL[cause]) {
+        return CAUSE_LABELS_INTERNAL[cause];
+    }
+    return CAUSE_LABELS[cause] || cause;
+}
+
+// Layer tag for a cause, given the payload's traffic mode.
+function causeLayer(cause, mode) {
+    if (mode === 'internal' && cause in CAUSE_LAYERS_INTERNAL) {
+        return CAUSE_LAYERS_INTERNAL[cause];
+    }
+    return CAUSE_LAYERS[cause];
+}
 
 // Fixed colour per cause, shared by the donut slices and the legend swatches.
 const CAUSE_COLORS = {
@@ -847,10 +974,18 @@ const OVERVIEW_TIPS = {
     dropped_frames_total: 'Σ (Δstream − 1): packets offered to the stream but never received',
     delta_drop_total: 'total Δraw_drop_total — RX-side drops (records never left the device)',
     delta_backpressure_total: 'total Δraw_send_backpressure_total — batches the desktop did not accept',
-    filled_records: 'records received inside the covered span',
-    empty_slots: 'slots inside the covered span without a record',
-    total_slots: 'covered span in slots: filled records + empty slots',
+    filled_records: 'records received inside the run',
+    filled_slots: 'slots that received at least one record',
+    extra_records: 'records beyond the first in a slot (arrived less than one slot apart)',
+    empty_slots: 'slots inside the run without a record',
+    total_slots: 'slots the run was declared to cover, rounded once from the recording span',
     empty_slots_low_rssi: 'empty slots classified as over-air loss (low neighbouring RSSI)'
+};
+
+// Tips that differ in internal mode. `generator_missed` says *which* generator
+// failed to produce the record, and in internal mode that is the device.
+const OVERVIEW_TIPS_INTERNAL = {
+    generator_missed: 'contiguous counters + normal RSSI — device generator produced no CSI'
 };
 
 // Code tables mirrored from `csi_header.rs`.
@@ -1049,10 +1184,17 @@ class DiagnosticView {
             if (empty.cause === 'air_loss') lowRssi += 1;
         }
         const filled = Array.isArray(diag.records) ? diag.records.length : 0;
+        // Distinct slots, not records: two records in one slot are one covered
+        // slot and one extra record.
+        const filledSlots = new Set(
+            (diag.records || []).map((record) => `${record.second}:${record.slot}`)
+        ).size;
         const total = filled + empties.length;
         return {
             total_slots: total,
+            filled_slots: filledSlots,
             filled_records: filled,
+            extra_records: Math.max(0, filled - filledSlots),
             empty_slots: empties.length,
             loss_ratio: total > 0 ? empties.length / total : 0,
             cause_counts: counts,
@@ -1075,8 +1217,12 @@ class DiagnosticView {
         const pct = (value) => (emptyTotal > 0 ? (value / emptyTotal) * 100 : 0);
 
         if (this.overviewKpis) {
+            const filledSlots = summary.filled_slots ?? summary.filled_records ?? 0;
+            const extraRecords = summary.extra_records
+                ?? Math.max(0, (summary.filled_records || 0) - filledSlots);
             const kpis = [
-                ['records / slots', `${summary.filled_records} / ${summary.total_slots}`, 'filled_records'],
+                ['filled / total slots', `${filledSlots} / ${summary.total_slots}`, 'filled_slots'],
+                ['extra records', `${extraRecords}`, 'extra_records'],
                 ['loss', `${(summary.loss_ratio * 100).toFixed(1)} %`, 'loss_ratio'],
                 ['empty slots', `${summary.empty_slots}`, 'empty_slots'],
                 ['dropped frames', `${summary.dropped_frames_total}`, 'dropped_frames_total'],
@@ -1092,14 +1238,15 @@ class DiagnosticView {
 
         if (this.overviewLegend) {
             const order = ['device_drop', 'desktop_backpressure', 'air_loss', 'generator_missed', 'ambiguous'];
+            const mode = this.trafficMode();
             this.overviewLegend.innerHTML = order
                 .map((cause) => {
                     const value = counts[cause] || 0;
-                    const layer = CAUSE_LAYERS[cause];
+                    const layer = causeLayer(cause, mode);
                     const tag = layer ? ` <span class="tip-layer ${layer}">${layer}</span>` : '';
                     return `<div class="diag-overview-legend-row" data-tip="${cause}">`
                         + `<span class="legend-swatch" style="background:${CAUSE_COLORS[cause]}"></span>`
-                        + `<span class="overview-legend-label">${CAUSE_LABELS[cause]}${tag}</span>`
+                        + `<span class="overview-legend-label">${causeLabel(cause, mode)}${tag}</span>`
                         + `<span class="overview-legend-value">${value} · ${pct(value).toFixed(1)} %</span>`
                         + `</div>`;
                 })
@@ -1162,7 +1309,7 @@ class DiagnosticView {
         }
 
         // Centre readout: the loss ratio is the headline number.
-        const total = (summary.total_slots || 0) || (emptyTotal + (summary.filled_records || 0));
+        const total = (summary.total_slots || 0) || (emptyTotal + (summary.filled_slots || 0));
         const lossPct = total > 0 ? (emptyTotal / total) * 100 : 0;
         ctx.fillStyle = '#e2e8f0';
         ctx.font = '700 20px ui-monospace, monospace';
@@ -1175,11 +1322,34 @@ class DiagnosticView {
         ctx.restore();
     }
 
+    // Tooltip body for a `data-tip` key. `generator_missed` differs by mode,
+    // for the same reason its label does: the tip names who failed to produce
+    // the record, and in internal mode that is the device, not this client.
+    //
+    // The mode lives on the payload accessors of the owning `CsiVisualizer`,
+    // not on this view: `this.data` is a copy set by `setData`.
+    overviewTip(key) {
+        if (key === 'generator_missed' && this.trafficMode() === 'internal') {
+            return OVERVIEW_TIPS_INTERNAL.generator_missed;
+        }
+        return OVERVIEW_TIPS[key];
+    }
+
+    // Traffic mode as seen by this view: delegate to the visualizer that owns
+    // the payload, falling back to this view's own copy.
+    trafficMode() {
+        if (this.visualizer && typeof this.visualizer.getTrafficMode === 'function') {
+            return this.visualizer.getTrafficMode();
+        }
+        const meta = this.data && this.data.metadata;
+        return (meta && meta.traffic_mode) || null;
+    }
+
     // Delegated hover: any element with `data-tip` inside the overview panel.
     onOverviewOver(event) {
         const target = event.target.closest('[data-tip]');
         if (!target || !this.overviewTooltip || !this.overviewBox) return;
-        const tip = OVERVIEW_TIPS[target.dataset.tip];
+        const tip = this.overviewTip(target.dataset.tip);
         if (!tip) return;
         this.overviewTooltip.innerHTML = `<div class="tip-title">${target.dataset.tip}</div>`
             + `<div class="tip-body">${tip}</div>`;
@@ -1558,11 +1728,12 @@ class DiagnosticView {
             const empty = this.emptySlotAt(second, slot);
             html += this.detailRow('slot time', 'theoretical slot time on the device clock, s', slotTime.toFixed(4));
             if (empty) {
+                const mode = this.trafficMode();
                 html += this.detailRow(
                     'classification',
-                    CAUSE_LABELS[empty.cause] || empty.cause,
+                    causeLabel(empty.cause, mode),
                     empty.cause,
-                    CAUSE_LAYERS[empty.cause]
+                    causeLayer(empty.cause, mode)
                 );
                 html += this.detailRow(
                     'dropped frames',

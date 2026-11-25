@@ -38,8 +38,12 @@ use std::{
 use tokio::{net::TcpListener, sync::mpsc, task::JoinError, time::interval};
 
 use crate::{
-    collection::{self, CollectionConfig, CollectionError, CollectionSummary},
+    collection::{
+        self, CollectionConfig, CollectionError, CollectionSummary, NominalPpsSource,
+        TrafficGenerator,
+    },
     decoder::{CsiPacket, DecodeError, FrameStreamDecoder},
+    device,
     visualization::{
         self, LiveDashboardSnapshot, VisualizationError, VisualizationOptions,
         prepare_visualization_data_with_options,
@@ -122,7 +126,7 @@ impl StreamingConfig {
                 "window must be greater than zero".to_string(),
             ));
         }
-        if self.collection.pps == 0 {
+        if self.collection.markers_enabled() && self.collection.pps == 0 {
             return Err(StreamingError::InvalidConfig(
                 "pps must be greater than zero".to_string(),
             ));
@@ -165,6 +169,13 @@ pub enum StreamingError {
     InvalidConfig(String),
     /// The dashboard server stopped unexpectedly.
     Server(String),
+    /// Preparing the run failed because of the device itself.
+    Device(device::DeviceError),
+    /// The device's traffic mode contradicts the one this run needs.
+    ///
+    /// Fatal before the dashboard opens: the capture would record nothing, or a
+    /// second uncounted stimulus. Carries the remedy command.
+    WrongDeviceMode(Box<device::Mismatch>),
 }
 
 impl fmt::Display for StreamingError {
@@ -178,6 +189,8 @@ impl fmt::Display for StreamingError {
             Self::State(message) => write!(f, "dashboard state error: {message}"),
             Self::InvalidConfig(message) => write!(f, "invalid streaming configuration: {message}"),
             Self::Server(message) => write!(f, "dashboard server error: {message}"),
+            Self::Device(error) => write!(f, "device pre-flight failed: {error}"),
+            Self::WrongDeviceMode(mismatch) => write!(f, "{mismatch}"),
         }
     }
 }
@@ -190,6 +203,8 @@ impl Error for StreamingError {
             Self::Visualization(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::Join(error) => Some(error),
+            Self::Device(error) => Some(error),
+            Self::WrongDeviceMode(mismatch) => Some(mismatch),
             Self::State(_) | Self::InvalidConfig(_) | Self::Server(_) => None,
         }
     }
@@ -234,6 +249,28 @@ pub async fn run(config: &StreamingConfig) -> Result<StreamingSummary, Streaming
     config.validate()?;
     let started = Instant::now();
 
+    // Resolve the nominal rate *before* anything is spawned or bound. The
+    // accumulator is moved into the decoder task at spawn and only publishes
+    // what it was constructed with, so a rate learned later could never reach
+    // the dashboard; it would show the fallback for the whole session.
+    //
+    // Doing it first also means a wrong-mode device fails before the port is
+    // taken and before a single marker is sent.
+    let device_status = device::read(&config.collection.device_endpoint()).await;
+    match device::require_mode(device_status.as_ref(), config.collection.traffic_generator) {
+        Ok(()) => {}
+        // Its own variant, not an `InvalidConfig` string: the process exit code
+        // (3) depends on telling "the device needs switching" from "this
+        // configuration is wrong", and a string prefix is not a reliable way to
+        // tell them apart.
+        Err(device::DeviceError::Mismatch(mismatch)) => {
+            return Err(StreamingError::WrongDeviceMode(mismatch));
+        }
+        Err(error) => return Err(StreamingError::Device(error)),
+    }
+    let (nominal_pps, nominal_pps_source) =
+        config.collection.resolve_nominal(device_status.as_ref());
+
     let state = Arc::new(RwLock::new(LiveDashboardSnapshot::Waiting {
         elapsed_seconds: 0.0,
         warmup_seconds: config.warmup.as_secs_f64(),
@@ -256,7 +293,14 @@ pub async fn run(config: &StreamingConfig) -> Result<StreamingSummary, Streaming
         .await
     });
 
-    let accumulator = LiveAccumulator::new(config, Arc::clone(&state), started);
+    let accumulator = LiveAccumulator::new(
+        config,
+        Arc::clone(&state),
+        started,
+        nominal_pps,
+        nominal_pps_source,
+        config.collection.traffic_generator,
+    );
     let update_interval = config.update_interval;
     let mut decoder_task = tokio::spawn(run_decoder_loop(chunk_rx, accumulator, update_interval));
 
@@ -374,12 +418,13 @@ fn build_summary(
     decoder: &DecoderLoopSummary,
     started: Instant,
 ) -> StreamingSummary {
-    let bytes_written = std::fs::metadata(&config.collection.output)
+    let output = config.collection.resolved_output();
+    let bytes_written = std::fs::metadata(&output)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
 
     StreamingSummary {
-        output: config.collection.output.clone(),
+        output,
         records_decoded: decoder.records_decoded,
         window_records: decoder.window_records,
         bytes_written,
@@ -400,7 +445,10 @@ struct LiveAccumulator {
     packets: Vec<CsiPacket>,
     origin_ticks: Option<u64>,
     source: Option<String>,
-    nominal_pps: f64,
+    /// Nominal rate resolved pre-flight; `None` means nothing declared one.
+    nominal_pps: Option<f64>,
+    nominal_pps_source: Option<NominalPpsSource>,
+    traffic_mode: TrafficGenerator,
     window_us: u64,
     warmup: Duration,
     started: Instant,
@@ -414,6 +462,9 @@ impl LiveAccumulator {
         config: &StreamingConfig,
         state: Arc<RwLock<LiveDashboardSnapshot>>,
         started: Instant,
+        nominal_pps: Option<f64>,
+        nominal_pps_source: Option<NominalPpsSource>,
+        traffic_mode: TrafficGenerator,
     ) -> Self {
         let source = config
             .collection
@@ -428,7 +479,9 @@ impl LiveAccumulator {
             packets: Vec::new(),
             origin_ticks: None,
             source,
-            nominal_pps: config.collection.pps as f64,
+            nominal_pps,
+            nominal_pps_source,
+            traffic_mode,
             window_us,
             warmup: config.warmup,
             started,
@@ -482,12 +535,18 @@ impl LiveAccumulator {
             self.source.as_deref(),
             origin_ticks,
             VisualizationOptions {
-                nominal_pps: Some(self.nominal_pps),
+                nominal_pps: self.nominal_pps,
+                nominal_pps_source: self.nominal_pps_source,
+                traffic_mode: Some(self.traffic_mode),
                 capture_end: false,
                 diagnostics: self.diagnostics,
                 // DSP is never computed while streaming: the analysis only
                 // exists once the capture is closed.
                 dsp: None,
+                // A live window counts up to its newest record, which is what
+                // `latest_ticks` measures; the window length is a memory bound,
+                // not a claim about how long the run is.
+                span_us: Some(latest_ticks.saturating_sub(origin_ticks)),
             },
         )?;
 
@@ -587,6 +646,34 @@ mod tests {
             config.validate(),
             Err(StreamingError::InvalidConfig(_))
         ));
+    }
+
+    #[test]
+    fn zero_pps_is_only_rejected_in_marker_mode() {
+        let external = StreamingConfig {
+            collection: CollectionConfig {
+                pps: 0,
+                ..CollectionConfig::default()
+            },
+            ..StreamingConfig::default()
+        };
+        assert!(
+            matches!(external.validate(), Err(StreamingError::InvalidConfig(_))),
+            "an external run with no marker rate would send nothing"
+        );
+
+        let internal = StreamingConfig {
+            collection: CollectionConfig {
+                pps: 0,
+                traffic_generator: TrafficGenerator::Internal,
+                ..CollectionConfig::default()
+            },
+            ..StreamingConfig::default()
+        };
+        assert!(
+            internal.validate().is_ok(),
+            "an internal run takes its rate from the device, so pps may be unset"
+        );
     }
 
     #[test]

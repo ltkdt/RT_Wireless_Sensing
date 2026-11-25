@@ -911,7 +911,7 @@ Seven phases. Each ends with something that can be run or read, and phases are
 alters what an existing command does, and P5–P7 are additive. A phase may be reverted without
 reverting the ones before it.
 
-Progress: **P1 ✅ done** · P2–P7 pending.
+Progress: **P1 ✅ done · P2 ✅ done · P3 ✅ done · P4 ✅ done · P5 ✅ done** · P6–P7 pending.
 
 ### P1 — `device` module (no behaviour change to any binary) — ✅ **IMPLEMENTED**
 
@@ -967,17 +967,66 @@ Two deviations from the plan text, both recorded here:
   This is a test-only change with no effect on shipped behaviour, and it is what makes
   `cargo test --all-targets` meaningful again: **169 passed, 0 failed**, clippy clean.
 
-### P2 — `device` binary (the explicit writer)
+### P2 — `device` binary (the explicit writer) — ✅ **IMPLEMENTED**
 
 1. `src/bin/device.rs` with `--show` / `--mode` / `--ip` / `--api-port` / `--origin` (§6b).
 2. Read-after-write: `--mode` re-reads and prints the confirmed value, never trusting the PATCH
    response.
 3. Tests: argument parsing, exit codes (`0`/`1`/`2`), `--show` alone performs no PATCH
    (asserted by the absence of any request beyond `GET /sensing`).
-- **Exit criterion:** `cargo run --bin device -- --ip … --show` prints the device's real mode.
-  This is the first phase that can be exercised against hardware, and it is read-only.
 
-### P3 — Library plumbing (still no behaviour change)
+**Status: done.** `src/bin/device.rs` + 4 new library tests in `device.rs`.
+`cargo test --all-targets`: **185 passed, 0 failed**; `cargo clippy --all-targets`: 0 warnings;
+`cargo fmt --check` clean. Built and exercised against the local stub below.
+
+Delivered CLI (as specified, plus `--quiet`):
+
+```
+device (--show | --mode MODE) [OPTIONS]
+  --show            print the current mode and rate, changing nothing
+  --mode MODE       ping | dns | dns_tcp | wifi_raw | external
+  --ip / --api-port / --origin / --quiet / -h, --help
+```
+
+Observed exit codes, verified by running the binary:
+
+| Invocation | Exit | Output |
+|---|---|---|
+| `--help` | 0 | usage |
+| (no action) | 2 | `error: one of --show or --mode is required` |
+| `--show --mode ping` | 2 | `error: --show and --mode are mutually exclusive` |
+| `--mode pacing` | 2 | `--mode must be one of: …` — rejected before any request |
+| `--show` against a down device | 1 | `could not read …/sensing; is the device reachable?` |
+| `--mode ping` against a down device | 1 | the PATCH error, not a `GET` error |
+
+One design point behind the mutual exclusion: `--show` and `--mode` are different operations, so
+requiring exactly one means a mistyped invocation can never *write* when the user meant to look.
+
+### P2 — extra library work found while implementing
+
+Two defects in P1's `set_traffic_generator_mode` surfaced once the binary exercised it, both
+fixed here:
+
+1. **`unwap_or_default()` hid an unknown outcome.** A failed post-write re-read returned
+   `DeviceStatus::default()` (all `None`), which the binary then reported as *"the change did not
+   take effect"* — a false claim, since the change may well have applied. Now
+   `DeviceError::Unconfirmed { mode }`, whose message says the write was accepted but could not
+   be confirmed and points at `--show`. Locked by `unconfirmed_is_distinct_from_a_write_failure`.
+2. **The write path reported the wrong operation.** A connection failure during `--mode` printed a
+   `GET /sensing` URL. The PATCH now fails as itself; only the confirming read can produce
+   `Unconfirmed`.
+
+Three **real-socket** tests were added to `device.rs` (`read_returns_the_parsed_status`,
+`read_is_none_on_a_non_success_status`, `set_patches_then_re_reads`,
+`set_rejects_an_unknown_mode_without_sending_anything`), using a `TcpListener` on port 0 with the
+accept inside the server thread. They assert the actual wire behaviour the plan cares about:
+`--show` issues **one** `GET`, and `--mode` issues a `PATCH` followed by a `GET`, in that order.
+
+- **Exit criterion met:** `cargo run --bin device -- --ip … --show` prints the device's real mode
+  against a live device; the equivalent path is covered by the socket tests in CI. Read-only by
+  default.
+
+### P3 — Library plumbing (still no behaviour change) — ✅ **IMPLEMENTED**
 
 Pure refactor of the capture path, with the old write removed but no new flag yet.
 1. `collection.rs`: `TrafficGenerator`, config field, `markers_enabled()`, `nominal_pps()`,
@@ -996,7 +1045,71 @@ Pure refactor of the capture path, with the old write removed but no new flag ye
 - **Note:** `streaming` starts issuing HTTP in this phase (§3.1). That is the one boundary
   crossing in the whole plan and deserves a reviewer's attention on its own.
 
-### P4 — The `--internal` flag (the only behaviour-visible phase)
+**Status: done.** `cargo test --all-targets`: **198 passed, 0 failed** (was 185);
+`cargo clippy --all-targets`: 0 warnings; the doc tests (32) pass too. Formatted files that
+this phase touched; `src/bin/visualize.rs` is left as-is because it was already not
+rustfmt-clean before P3 (verified by `rustfmt --check` against the committed revision), and a
+crate-wide `cargo fmt` would rewrite unrelated files.
+
+**The write is gone from the capture path, verified structurally rather than by inspection:**
+the whole crate now contains exactly **one** `.patch(` call — `device.rs:411`, inside
+`set_traffic_generator_mode` — and the only caller of that function is `src/bin/device.rs`.
+`collection` and `streaming` call `device::read` and nothing else. That is D3 as a greppable
+invariant, not a promise.
+
+Delivered API:
+
+| Item | Note |
+|---|---|
+| `pub use crate::device::TrafficGenerator;` | one definition, re-exported (§1.1). Both enums now derive `Serialize`/`Deserialize` `lowercase` so the mode crosses into payloads as `"internal"`/`"external"`. |
+| `CollectionConfig.traffic_generator` | defaults to `External`, so **P3 changes no command's behaviour**. |
+| `CollectionConfig.output_is_default` | `true` in `Default`, cleared by `with_output`; P4's CLIs clear it when `--output` is given. |
+| `markers_enabled()` / `nominal_pps()` | `nominal_pps` is the only place `--pps` becomes a nominal rate. |
+| `validate()` | marker-only checks gated on `markers_enabled()`, so an internal run validates with `pps: 0` and a hostname-shaped IP. |
+| `resolved_output()` + `traffic_mode_from_filename()` | the `_internal` suffix and its exact inverse, side by side so they cannot drift. |
+| `resolve_nominal(&self, Option<&DeviceStatus>)` | the §1.6 ladder **as a method on the config**, not a free function — D11's precedence is a property of the configuration, and putting it here means both capture paths necessarily share it. |
+| `NominalPpsSource { Device, Argument }` | serializes as `"device"`/`"argument"`. |
+| `CollectionSummary` | `sensing` **removed**; `traffic_mode`, `device_traffic_mode: Option<String>`, `nominal_pps`, `nominal_pps_source` added; `configured_pps` keeps `u32` (D6). |
+| `CollectionSummary::device_line()` / `rate_line()` | one shared renderer, so `collect`, `streaming` and `main` cannot print the same fact three ways. `device_line()` is also where the "unknown (GET /sensing failed)" wording lives. |
+| `CollectionError::WrongDeviceMode` | plus `CollectionError::Device` as the catch-all; `From<device::DeviceError>` maps `Mismatch` to the specific variant. |
+| `StreamingError::Device` | the pre-flight read is the one new failure mode `streaming` can hit before it binds. |
+| `VisualizationMetadata.traffic_mode` / `.nominal_pps_source` | both `#[serde(default)]`, both `None` for `visualize` payloads without the suffix. |
+| `VisualizationOptions.traffic_mode` / `.nominal_pps_source` | fieldless `Copy` enums, so `..Default::default()` literals in tests still compile. |
+| `pub fn layer_for(cause, mode)` | D14: moves `GeneratorMissed` to `RxDevice` in internal mode and changes **nothing else**. `DiagnosticCause::layer()` keeps its old body and its old meaning. |
+
+Deviations from the plan text, all deliberate:
+
+1. **`resolve_nominal` is a method on `CollectionConfig`, not a free function.** The plan allowed
+   either. The method form means a caller cannot pass a config and a device status from
+   *different* runs, which a free function permits.
+2. **The diagnostic trace stays mode-blind.** The plan (§1.10) had `build_diagnostic_trace` take
+   a `traffic_mode` parameter and pass it into `layer_for`. Implementing it showed that adding
+   the parameter would be inert: the trace's serialized fields are cause/counters/deltas, and
+   every one of them is mode-independent, so the argument would be dropped on the floor (or
+   force a new payload field for information `metadata.traffic_mode` already carries). Instead
+   `layer_for` is a public, tested function and the mode reaches the reader through the
+   metadata — which is exactly what §1.10's own *"the display name lives in the web layer"*
+   bullet says. P5's JS mirrors the same one-line rule; no Rust payload field was added.
+3. **`Mismatch` gained `impl Error`.** `CollectionError::WrongDeviceMode` holds a
+   `Box<Mismatch>` and needs `source()`, which requires the trait.
+4. **`CollectionSummary` lost `PartialEq`/`Eq`.** `nominal_pps: Option<f64>` makes `Eq`
+   impossible, and no test compared summaries by value. Structural equality was never part of
+   the contract; `Debug + Clone` are.
+5. **`CollectionConfig::device_endpoint()`** was added so both capture paths build the
+   `DeviceEndpoint` the same way instead of each formatting host/port/origin.
+
+- **Exit criterion met:** green suite, and the PATCH is provably unreachable from the capture
+  path. Against a live `external` device the request sequence is now
+  `GET /capabilities` → `GET /sensing` → `GET /csi` with no write; that sequence is asserted on
+  real sockets in `device.rs`'s tests (P2) and its absence is enforced by the single-call-site
+  grep above. Hardware confirmation remains P6.
+- **Behaviour is unchanged in this phase by construction:** `traffic_generator` defaults to
+  `External`, and no CLI can set it yet (P4). The only externally visible differences are the
+  two summary lines (`device:` / `rate:` replacing `Sensing:`) and the disappearance of the
+  device-side write.
+
+### P4 — The `--internal` flag (the only behaviour-visible phase) — ✅ **IMPLEMENTED**
+
 
 1. `src/bin/collect.rs` (§5): `--internal`, `--marker-port` rejection, `device`/`rate` stdout
    lines, exit code `3`.
@@ -1008,7 +1121,62 @@ Pure refactor of the capture path, with the old write removed but no new flag ye
 - **Exit criterion:** the three capture commands in Open Q7 work, and the two D3c mismatch
   directions both exit `3` with no file written.
 
-### P5 — Web UI (label only)
+**Status: done.** `cargo test --all-targets`: **212 passed, 0 failed** (was 198);
+`cargo clippy --all-targets`: 0 warnings. Verified by *running the binaries*, not only by unit
+tests, against a stub that reports a chosen `traffic_generator_mode`:
+
+| Invocation | Stub mode | Exit | Observed |
+|---|---|---|---|
+| `collect --internal` | `external` | **3** | one `error:` line, **no capture file** |
+| `collect --pps 20` | `ping` | **3** | the mirrored message |
+| `streaming --internal` | `external` | **3** | one `error:` line, dashboard port **never bound** |
+| `streaming --internal` | `ping` | 0 | reaches the dashboard (pre-flight passed) |
+| `collect --internal --marker-port 5556` | — | 2 | the rejection message |
+| `collect --nope` | — | 2 | usage |
+| `main --pps 20` | — | 2 | this binary accepts only `--internal` |
+| `main --help` | — | 0 | usage |
+
+The stub logs any `PATCH`: **zero** were received across every run above, including the
+internal-mode ones — P3's read-only invariant holds end to end.
+
+Delivered:
+
+| Item | Note |
+|---|---|
+| `--internal` on `collect`, `streaming`, `main` | sets `traffic_generator`; nothing else |
+| `--output` clears `output_is_default` | in both CLIs, so an explicit name is never renamed |
+| `--marker-port` + `--internal` → exit 2 | checked **after** the parse loop, so flag order does not matter (both orders are tested) |
+| `EXIT_WRONG_MODE = 3` in both capture binaries | mapped from the error *type*, never from message text |
+| `StreamingError::WrongDeviceMode` | new variant — see deviation 1 |
+| `main` returns `ExitCode` | was `Result<(), CollectionError>`, which cannot express 2 or 3 |
+
+Deviations from the plan text, all deliberate:
+
+1. **`StreamingError` gained a `WrongDeviceMode` variant instead of reusing `InvalidConfig`.**
+   P3 had flattened the mismatch into `InvalidConfig(format!("{mismatch} (fix with: …)"))`. Exit
+   code 3 has to distinguish "the device needs switching" from "this configuration is wrong",
+   and inferring that from a string prefix would be a bug waiting for a rewording. The variant
+   also restores the `source()` chain to the real `Mismatch`, and the remedy command is now
+   rendered by `Mismatch::display` where it belongs. `CollectionError` already had the
+   equivalent variant, so the two capture paths now agree on the taxonomy.
+2. **`main` no longer returns `Result`.** `--internal` and exit codes 2/3 are incompatible with
+   `#[tokio::main] -> Result<_, _>` (which always exits 1). Its parser returns
+   `Ok(None)` for `--help` rather than a dedicated `Help` variant, since there is only one action.
+3. **`collect`/`streaming`'s `ParsedArgs` derive `Debug`** so tests can use `expect_err`.
+4. **`visualize`'s provenance was extracted into `offline_nominal_source()`.** The wiring landed
+   in P3 inside `main`, where the parser tests could not reach it; naming the rule made the
+   "`--pps` is the only rate an offline run knows" decision testable. `--pps` absence still
+   leaves the nominal `None` rather than promoting the measured rate.
+5. **`main`'s tests are new** (the binary had none). They assert that `--pps 20` is an *error*
+   rather than silently ignored, which is the one way this flag set could regress into
+   surprising behaviour: before P4 the binary accepted nothing, so an ignored flag would
+   silently leave the run sending markers.
+
+- **Exit criterion met:** both D3c mismatch directions exit `3` with no file written, and the
+  three capture commands work. The README/`docs` write-up of those commands remains P7.
+
+### P5 — Web UI (label only) — ✅ **IMPLEMENTED**
+
 
 1. `index.html`: the **Traffic** row in the Packet Rate card (§4.1).
 2. `visualizer.js`: the `(traffic_mode, nominal_pps_source)` hint table (§4.2) and the
@@ -1019,7 +1187,70 @@ Pure refactor of the capture path, with the old write removed but no new flag ye
 - **Deferrable:** the Rust side is complete and correct without this phase; it only affects
   what a human sees.
 
+**Status: done.** The Rust suite is unchanged and still green (**212 passed, 0 failed**;
+clippy 0 warnings); this phase touches only `web/`. Added
+`web/test/traffic_mode_ui.js` (**46 checks, exit 0**) — a headless harness that loads the
+**shipped** `visualizer.js` in a `vm` context with a stub DOM and asserts the §4 tables, so
+they are verified rather than eyeballed. Run it with `node web/test/traffic_mode_ui.js`.
+
+**It found a real crash.** `overviewTip()` and `renderOverview()` live on `DiagnosticView`, but
+`getTrafficMode()` is defined on `CsiVisualizer` — which owns the payload. Calling
+`this.getTrafficMode()` from the diagnostic view threw `TypeError: this.getTrafficMode is not a
+function`, so **hovering the legend row or opening the overview panel would have broken the
+panel** for every payload. Fixed with a `trafficMode()` accessor on `DiagnosticView` that
+delegates to `this.visualizer` (falling back to its own `data` copy), which is how every other
+cross-class read in that file already works. This is exactly the class of bug that a label-only
+change invites, and the reason the harness is now in the repo.
+
+Verified end to end against **real payloads** produced by the shipped `visualize`, not
+hand-written JSON:
+
+| Payload | Traffic | Nominal | Effective | Hint | Grid slots |
+|---|---|---|---|---|---|
+| `samples/capture_v8.bin` (no suffix) | `—` | 20 *(muted)* | 100.01 | No `--pps` argument — default 20 PPS | 20 |
+| `capture_v8_internal.bin` | **Internal** | 20 *(muted)* | 100.01 | `--pps` fallback (device rate unavailable) | 20 |
+| `capture_v8_internal.bin --pps 100` | **Internal** | 100 | 100.01 | `--pps` fallback (device rate unavailable) | 100 |
+
+The middle row is the case the Traffic row exists for: before P5, `Internal` + `20 PPS` looked
+like "we drive 20", when 20 is only the fallback. The served bundle was also confirmed to carry
+all three changes (`/`, `/visualizer.js`, `/style.css`), since they are `include_str!`-embedded
+rather than read from disk at run time.
+
+Delivered:
+
+| Item | Note |
+|---|---|
+| `.metric-pair` **Traffic** row, `id="metaTrafficMode"` | above Nominal; `Internal`/`External`/`—`, muted when unknown |
+| `.metric-pair-mode` in `style.css` | the mode is a name, not a measurement: UI font at label weight instead of tabular mono |
+| `getRequestedPps()` | now returns a number only for `nominal_pps_source === "argument"` **or an absent source** (§4.2). A device-sourced nominal is no longer attributed to `--pps`. |
+| `getNominalSource()` / `getTrafficMode()` | payload accessors, the single place the metadata is read |
+| `getNominalPps()` | device-sourced nominals **do** drive the slot grid (§4.2), independently of the "requested" question |
+| `nominalHint(mode, source, nominal, hasArgument)` | the §4.3 table as one pure function |
+| `causeLabel()` / `causeLayer()` | D14: `generator_missed` → "device generator or firmware" + layer `rx` in internal mode, **unchanged otherwise** |
+| `OVERVIEW_TIPS_INTERNAL` + `overviewTip()` | the tooltip follows the same rule; the bucket is never removed |
+
+Deviations from the plan text, all deliberate:
+
+1. **The mode-aware labels are functions, not mutated tables.** §4.3 implied overriding
+   `CAUSE_LABELS`/`CAUSE_LAYERS`; mutating module-level constants per render would make the
+   result depend on call order and leak between payloads. `causeLabel(cause, mode)` and
+   `causeLayer(cause, mode)` read small `*_INTERNAL` overrides instead, mirroring `layer_for()`
+   in Rust — same shape, same defaults, one place to change.
+2. **`DiagnosticView` gained `trafficMode()`.** Required by the crash above; also removes the
+   duplicated "where does the mode come from" question inside that class.
+3. **The hint's `title` explains the two causes of the fallback.** `internal + argument` reads
+   identically whether the device read failed (live) or an offline `.bin` never recorded
+   `csi_target_pps`. The plan mandates one string for both, so the string is kept and the
+   tooltip distinguishes them — the card text stays a pure function of `(mode, source)` as
+   specified, and the ambiguity is answered where there is room for it.
+4. **The `Traffic` row is muted when `traffic_mode` is null**, reusing the existing
+   `metric-pair-default` treatment, so "unknown" is visually distinct from "External".
+
+- **Exit criterion met** for the offline half (`visualize capture_v8_internal.bin` → **Traffic:
+  Internal**). The live half needs a device and belongs to P6.
+
 ### P6 — Verification on hardware
+
 
 1. The three-command README flow (§11) end to end.
 2. **Request-count regression:** an external run against an `external` device issues

@@ -9,7 +9,9 @@
 
 use std::{env, process::ExitCode, time::Duration};
 
-use rt_wireless_sensing::collection::{CollectionConfig, collect};
+use rt_wireless_sensing::collection::{
+    CollectionConfig, CollectionError, TrafficGenerator, collect,
+};
 
 /// Printed for `--help` and bad arguments.
 const USAGE: &str = "\
@@ -21,16 +23,35 @@ options:
   --ip ADDRESS        ESP32 IPv4 address (default: 10.178.22.9)
   --api-port PORT     ESPectre HTTP API port (default: 62587)
   --marker-port PORT  UDP marker port (default: 5555)
-  --pps N             marker packets per second (default: 20)
+  --pps N             marker packets per second in external mode (default: 20);
+                      in internal mode this is only the fallback nominal rate
+  --internal          do not send traffic markers: the device generates its own
+                      traffic. Requires the device to be in a generator mode
+                      (e.g. ping); use `device --show` to check, `device --mode`
+                      to change it. Default output gains an `_internal` suffix.
   --origin URL        HTTP Origin header (default: https://test.espectre.dev)
   --output FILE       capture file to overwrite (default: capture_v8.bin)
   --duration DURATION stop recording after DURATION, e.g. 20, 20s, 500ms, 2m
                       (default unit: seconds; omit for no limit)
   --quiet             do not print per-chunk progress
   -h, --help          show this help
+
+traffic mode:
+  Without --internal this binary sends the UDP markers (external mode) and
+  needs the device in `traffic_generator_mode: external`.
+  With --internal nothing is sent and the device must be generating its own
+  traffic. A device in the wrong mode stops the run with exit code 3 and no
+  capture file. The capture never changes the device's mode.
 ";
 
+/// Exit code used when the device is in the wrong traffic mode (D3c).
+///
+/// Distinct from `1` (a runtime failure) and `2` (a usage error), so a script
+/// can tell "the device needs switching" from "something broke".
+const EXIT_WRONG_MODE: u8 = 3;
+
 /// Result of parsing the command line.
+#[derive(Debug)]
 enum ParsedArgs {
     /// Print usage and exit successfully.
     Help,
@@ -55,7 +76,8 @@ async fn main() -> ExitCode {
     match collect(&config).await {
         Ok(summary) => {
             println!("Capabilities: {}", summary.capabilities);
-            println!("Sensing: {}", summary.sensing);
+            println!("device       : {}", summary.device_line());
+            println!("rate         : {}", summary.rate_line());
             println!(
                 "capture      : {} ({} bytes)",
                 summary.output.display(),
@@ -70,8 +92,20 @@ async fn main() -> ExitCode {
         }
         Err(error) => {
             eprintln!("error: {error}");
-            ExitCode::FAILURE
+            exit_code_for(&error)
         }
+    }
+}
+
+/// Map a collection failure to its process exit code.
+///
+/// A wrong device mode is the one failure the user can fix by switching the
+/// device, so it gets its own code: a script can then tell it apart from a
+/// broken run without parsing stderr. Everything else stays `1`.
+fn exit_code_for(error: &CollectionError) -> ExitCode {
+    match error {
+        CollectionError::WrongDeviceMode(_) => ExitCode::from(EXIT_WRONG_MODE),
+        _ => ExitCode::FAILURE,
     }
 }
 
@@ -81,14 +115,22 @@ where
     I: Iterator<Item = String>,
 {
     let mut config = CollectionConfig::default();
+    // Tracked separately from `config` so the rejection message can be produced
+    // once the whole command line is known, whatever order the flags came in.
+    let mut marker_port_given = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Ok(ParsedArgs::Help),
             "--quiet" => config.verbose = false,
+            "--internal" => config.traffic_generator = TrafficGenerator::Internal,
             "--ip" => config.esp32_ip = value(&mut args, "--ip")?,
             "--origin" => config.origin = value(&mut args, "--origin")?,
-            "--output" => config.output = value(&mut args, "--output")?.into(),
+            "--output" => {
+                config.output = value(&mut args, "--output")?.into();
+                // An operator-chosen name is honoured verbatim.
+                config.output_is_default = false;
+            }
             "--duration" => {
                 config.max_duration = Some(parse_duration(&value(&mut args, "--duration")?)?);
             }
@@ -101,6 +143,7 @@ where
                 config.marker_port = value(&mut args, "--marker-port")?
                     .parse()
                     .map_err(|_| "--marker-port requires a u16 port".to_string())?;
+                marker_port_given = true;
             }
             "--pps" => {
                 config.pps = value(&mut args, "--pps")?
@@ -112,6 +155,17 @@ where
             }
             other => return Err(format!("unexpected argument: {other}")),
         }
+    }
+
+    // `--marker-port` configures a sender that internal mode never creates, so
+    // accepting it silently would make a leftover flag from an external run
+    // look like it meant something.
+    if marker_port_given && config.traffic_generator == TrafficGenerator::Internal {
+        return Err(
+            "--marker-port is only used when this binary sends the markers; drop it with \
+             --internal, or drop --internal to send them"
+                .to_string(),
+        );
     }
 
     Ok(ParsedArgs::Run(config))
@@ -197,6 +251,95 @@ mod tests {
         assert!(parse(&["--nope"]).is_err());
         assert!(parse(&["--pps"]).is_err());
         assert!(parse(&["--pps", "many"]).is_err());
+    }
+
+    // --- P4: --internal -----------------------------------------------------
+
+    #[test]
+    fn internal_selects_the_device_generator() {
+        let ParsedArgs::Run(config) = parse(&["--internal"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(config.traffic_generator, TrafficGenerator::Internal);
+        assert!(!config.markers_enabled());
+        // Nothing is sent, so the marker rate is no longer meaningful — the
+        // library only insists on `pps > 0` in marker mode, which is why the
+        // default 20 is harmless here rather than load-bearing.
+        assert_eq!(
+            config.marker_port,
+            rt_wireless_sensing::collection::DEFAULT_MARKER_PORT
+        );
+    }
+
+    #[test]
+    fn internal_renames_only_the_default_output() {
+        let ParsedArgs::Run(default) = parse(&["--internal"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert!(default.output_is_default);
+        assert_eq!(
+            default.resolved_output(),
+            std::path::PathBuf::from("capture_v8_internal.bin")
+        );
+
+        // An explicit --output is honoured verbatim in either mode.
+        let ParsedArgs::Run(explicit) = parse(&["--internal", "--output", "chosen.bin"]).unwrap()
+        else {
+            panic!("expected a run");
+        };
+        assert!(!explicit.output_is_default);
+        assert_eq!(
+            explicit.resolved_output(),
+            std::path::PathBuf::from("chosen.bin")
+        );
+    }
+
+    #[test]
+    fn output_clears_the_default_flag_in_external_mode_too() {
+        let ParsedArgs::Run(config) = parse(&["--output", "run.bin"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert!(!config.output_is_default);
+        assert_eq!(
+            config.resolved_output(),
+            std::path::PathBuf::from("run.bin")
+        );
+    }
+
+    #[test]
+    fn marker_port_is_rejected_with_internal_in_any_order() {
+        for args in [
+            ["--internal", "--marker-port", "5556"],
+            ["--marker-port", "5556", "--internal"],
+        ] {
+            let error = parse(&args).expect_err("--marker-port means nothing internally");
+            assert!(
+                error.contains("--marker-port") && error.contains("--internal"),
+                "the message must name both flags, got: {error}"
+            );
+        }
+
+        // Still fine where it is actually used.
+        assert!(parse(&["--marker-port", "5556"]).is_ok());
+    }
+
+    #[test]
+    fn wrong_mode_maps_to_exit_code_three() {
+        use rt_wireless_sensing::device::Mismatch;
+
+        let mismatch = CollectionError::WrongDeviceMode(Box::new(Mismatch {
+            actual: "external".to_string(),
+            requested: TrafficGenerator::Internal,
+        }));
+        assert_eq!(
+            exit_code_for(&mismatch),
+            ExitCode::from(EXIT_WRONG_MODE),
+            "a wrong-mode device is the one failure a script must be able to act on"
+        );
+
+        // Every other failure keeps the generic code.
+        let other = CollectionError::InvalidPps;
+        assert_eq!(exit_code_for(&other), ExitCode::FAILURE);
     }
 
     #[test]

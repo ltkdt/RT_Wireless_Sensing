@@ -160,6 +160,13 @@ body {
     color: var(--text-secondary);
     font-style: italic;
 }
+/* Who produces the traffic: a mode name, not a measurement, so it is set in
+   the UI font at label weight instead of the tabular monospace numerals. */
+.metric-pair-value.metric-pair-mode {
+    font-size: 1rem;
+    font-family: inherit;
+    letter-spacing: 0.02em;
+}
 
 /* Classification Card */
 .metric-card.classification-card {

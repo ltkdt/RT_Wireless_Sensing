@@ -11,6 +11,7 @@
 
 use std::{env, path::PathBuf, process::ExitCode};
 
+use rt_wireless_sensing::collection::{NominalPpsSource, traffic_mode_from_filename};
 use rt_wireless_sensing::dsp::{InterpMethod, NormScheme};
 use rt_wireless_sensing::visualization::{
     DspOptions, VisualizationData, VisualizationOptions, serve_dashboard,
@@ -102,9 +103,15 @@ async fn main() -> ExitCode {
         source_name,
         VisualizationOptions {
             nominal_pps: options.pps,
+            nominal_pps_source: offline_nominal_source(options.pps),
+            traffic_mode: traffic_mode_from_filename(source_name.unwrap_or_default()),
             capture_end: true,
             diagnostics: true,
             dsp: options.dsp,
+            // The file is the whole run: a `--duration` capture is cut at its
+            // limit when it is written, so the span is simply how far the
+            // records reach.
+            span_us: None,
         },
     ) {
         Ok(data) => data,
@@ -322,6 +329,22 @@ fn print_summary(data: &VisualizationData) {
     if let Some(ch) = m.channel {
         println!("channel      : {}", ch);
     }
+    // Coverage is a slot count, not a record count: the slots the run was
+    // declared to cover, how many of them received a record, and the records
+    // that landed in a slot another record already filled.
+    if let Some(diag) = &data.diagnostics {
+        let summary = &diag.summary;
+        println!(
+            "slots        : {} filled / {} total ({:.1}% empty)",
+            summary.filled_slots,
+            summary.total_slots,
+            summary.loss_ratio * 100.0
+        );
+        println!(
+            "extra records: {} (a slot took more than one record)",
+            summary.extra_records
+        );
+    }
 }
 
 fn open_in_browser(target: &str) -> Result<(), std::io::Error> {
@@ -338,9 +361,25 @@ fn open_in_browser(target: &str) -> Result<(), std::io::Error> {
         .map(|_| ())
 }
 
+/// Provenance of the nominal rate for an **offline** payload.
+///
+/// `visualize` has no device to ask, so the only nominal rate it can know about
+/// is one the operator typed: `--pps` → [`NominalPpsSource::Argument`]. Without
+/// the flag the nominal stays `None` (the dashboard shows the measured rate)
+/// rather than inventing a device rate no live session produced.
+///
+/// The traffic mode is *not* derived here — see [`traffic_mode_from_filename`],
+/// which reads it back from the `_internal` suffix. Renaming a capture can
+/// therefore lie about the mode; that is accepted, because the alternative is
+/// no offline provenance at all.
+fn offline_nominal_source(pps: Option<f64>) -> Option<NominalPpsSource> {
+    pps.map(|_| NominalPpsSource::Argument)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rt_wireless_sensing::collection::TrafficGenerator;
     use std::path::Path;
 
     fn parse(arguments: &[&str]) -> Result<ParsedArgs, String> {
@@ -455,5 +494,40 @@ mod tests {
         assert!(parse(&["run.bin", "--dsp-norm", "zscore"]).is_err());
         assert!(parse(&["run.bin", "--dsp-max-gap-ms", "-5"]).is_err());
         assert!(parse(&["run.bin", "--dsp-max-gap-ms", "soon"]).is_err());
+    }
+
+    // --- P4: the `_internal` suffix restores the traffic mode ---------------
+
+    #[test]
+    fn internal_suffix_restores_the_traffic_mode() {
+        // `visualize` has no device, so the file name is the only provenance.
+        for name in [
+            "capture_v8_internal.bin",
+            "/tmp/capture_v8_internal.bin",
+            "run_internal.bin",
+        ] {
+            assert_eq!(
+                traffic_mode_from_filename(name),
+                Some(TrafficGenerator::Internal),
+                "{name} should read back as internal"
+            );
+        }
+
+        // Everything else is unknown, not "external": a name proves nothing.
+        for name in ["capture_v8.bin", "internal.bin", "capture_internal_v8.bin"] {
+            assert_eq!(traffic_mode_from_filename(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn offline_provenance_only_claims_what_the_argument_says() {
+        // `--pps` is the one rate an offline run genuinely knows.
+        assert_eq!(
+            offline_nominal_source(Some(100.0)),
+            Some(NominalPpsSource::Argument)
+        );
+        // Without it the nominal stays unset rather than being invented from
+        // the measured rate.
+        assert_eq!(offline_nominal_source(None), None);
     }
 }

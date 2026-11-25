@@ -158,8 +158,7 @@ fn diagnostics_are_attached_and_old_payloads_still_parse() {
 
     // Payloads from before the diagnostic view (no `diagnostics` field) must
     // still deserialize, with the field as None so the toggle stays hidden.
-    let mut value: serde_json::Value =
-        serde_json::from_str(&json_str).expect("JSON must be valid");
+    let mut value: serde_json::Value = serde_json::from_str(&json_str).expect("JSON must be valid");
     value
         .as_object_mut()
         .expect("top level object")
@@ -263,11 +262,14 @@ fn prepare_with(
         origin_ticks,
         VisualizationOptions {
             nominal_pps: Some(pps),
+            nominal_pps_source: None,
+            traffic_mode: None,
             capture_end: true,
             diagnostics,
             // The synthetic fixtures are tiny; the DSP view is exercised by its
             // own tests below.
             dsp: None,
+            span_us: None,
         },
     )
     .expect("synthetic stream should prepare")
@@ -297,9 +299,12 @@ fn diagnostic_trace_is_optional() {
         origin,
         VisualizationOptions {
             nominal_pps: Some(100.0),
+            nominal_pps_source: None,
+            traffic_mode: None,
             capture_end: true,
             diagnostics: false,
             dsp: None,
+            span_us: None,
         },
     )
     .expect("synthetic stream should prepare");
@@ -346,9 +351,12 @@ fn dsp_view_is_optional() {
             origin,
             VisualizationOptions {
                 nominal_pps: Some(20.0),
+                nominal_pps_source: None,
+                traffic_mode: None,
                 capture_end: true,
                 diagnostics: false,
                 dsp,
+                span_us: None,
             },
         )
         .expect("synthetic stream should prepare")
@@ -380,9 +388,11 @@ fn dsp_view_is_optional() {
 /// The DSP grid is the diagnostic slot grid: column `j` is `(j / N, j % N)`.
 #[test]
 fn dsp_grid_matches_slot_grid_on_capture() {
-    let data =
-        VisualizationData::from_file_with_pps(&rt_wireless_sensing::fixtures::capture_v8(), Some(100.0))
-            .expect("decode");
+    let data = VisualizationData::from_file_with_pps(
+        &rt_wireless_sensing::fixtures::capture_v8(),
+        Some(100.0),
+    )
+    .expect("decode");
     let trace = data.diagnostics.as_ref().expect("trace");
     let dsp = data.dsp.as_ref().expect("dsp view");
 
@@ -434,7 +444,9 @@ fn dsp_grid_matches_slot_grid_on_capture() {
     let mut max = f32::NEG_INFINITY;
     for row in phase {
         for value in row {
-            assert!(*value >= -std::f32::consts::PI - 1e-5 && *value <= std::f32::consts::PI + 1e-5);
+            assert!(
+                *value >= -std::f32::consts::PI - 1e-5 && *value <= std::f32::consts::PI + 1e-5
+            );
             min = min.min(*value);
             max = max.max(*value);
         }
@@ -445,9 +457,11 @@ fn dsp_grid_matches_slot_grid_on_capture() {
 /// The null-bin table on a real 64-subcarrier capture is exactly HT20's.
 #[test]
 fn dsp_null_bins_on_capture_are_the_ht20_table() {
-    let data =
-        VisualizationData::from_file_with_pps(&rt_wireless_sensing::fixtures::capture_v8(), Some(100.0))
-            .expect("decode");
+    let data = VisualizationData::from_file_with_pps(
+        &rt_wireless_sensing::fixtures::capture_v8(),
+        Some(100.0),
+    )
+    .expect("decode");
     let dsp = data.dsp.as_ref().expect("dsp view");
     assert_eq!(dsp.null_subcarriers, vec![0, 1, 2, 3, 32, 61, 62, 63]);
 }
@@ -455,9 +469,11 @@ fn dsp_null_bins_on_capture_are_the_ht20_table() {
 /// A normalization adds the third panel and leaves the resampled pair intact.
 #[test]
 fn dsp_normalization_adds_a_panel() {
-    let plain =
-        VisualizationData::from_file_with_pps(&rt_wireless_sensing::fixtures::capture_v8(), Some(100.0))
-            .expect("decode");
+    let plain = VisualizationData::from_file_with_pps(
+        &rt_wireless_sensing::fixtures::capture_v8(),
+        Some(100.0),
+    )
+    .expect("decode");
     let base = plain.dsp.as_ref().expect("dsp view");
 
     let bytes = fs::read(rt_wireless_sensing::fixtures::capture_v8()).expect("read capture");
@@ -527,12 +543,15 @@ fn dsp_max_gap_masks_columns() {
         origin,
         VisualizationOptions {
             nominal_pps: Some(100.0),
+            nominal_pps_source: None,
+            traffic_mode: None,
             capture_end: true,
             diagnostics: false,
             dsp: Some(DspOptions {
                 max_gap_ms: Some(200.0),
                 ..DspOptions::default()
             }),
+            span_us: None,
         },
     )
     .expect("prepare");
@@ -554,7 +573,11 @@ fn dsp_max_gap_masks_columns() {
         .map(|(j, _)| j)
         .collect();
     assert!(!masked.is_empty(), "the 0.3 s hole must mask columns");
-    assert!(!bridged.is_empty(), "the 0.15 s hole must be bridged: {:?}", dsp.time_state);
+    assert!(
+        !bridged.is_empty(),
+        "the 0.15 s hole must be bridged: {:?}",
+        dsp.time_state
+    );
     // The masked hole comes first in time, the bridged one after it.
     assert!(*masked.last().unwrap() < *bridged.first().unwrap());
 
@@ -570,7 +593,8 @@ fn dsp_max_gap_masks_columns() {
 
 #[test]
 fn diagnostic_grid_agrees_with_occupancy_on_capture() {
-    let data = VisualizationData::from_file(&rt_wireless_sensing::fixtures::capture_v8()).expect("decode");
+    let data =
+        VisualizationData::from_file(&rt_wireless_sensing::fixtures::capture_v8()).expect("decode");
     let trace = data.diagnostics.as_ref().expect("trace");
     let slots = trace.slots_per_second;
 
@@ -638,11 +662,7 @@ fn explicit_pps_keeps_the_slot_grid_at_the_configured_rate() {
         "filled {} of 200",
         full.filled_slots
     );
-    assert!(
-        full.empty_slots >= 99,
-        "empty {} of 200",
-        full.empty_slots
-    );
+    assert!(full.empty_slots >= 99, "empty {} of 200", full.empty_slots);
 
     let measured_trace = measured.diagnostics.as_ref().expect("trace");
     assert!(measured_trace.slots_per_second < 200);
@@ -651,11 +671,11 @@ fn explicit_pps_keeps_the_slot_grid_at_the_configured_rate() {
 #[test]
 fn capture_summary_aggregates_empty_slot_causes() {
     // 10 slots per second: slot i starts at i * 100 ms. One gap of each
-    // attributable kind, plus a trailing slot with no closing record:
+    // attributable kind, then a full slot that takes two records:
     //
     //   slot 0 filled | 1 device_drop | 2 filled | 3 desktop_backpressure
     //   slot 4 filled (weak) | 5 air_loss | 6 filled | 7 generator_missed
-    //   slot 8 filled | 9 ambiguous (no closing record)
+    //   slot 8 filled twice (one extra record)
     let origin = 1_000_000;
     let samples = [
         Sample::new(1, origin),
@@ -669,27 +689,31 @@ fn capture_summary_aggregates_empty_slot_causes() {
         // bordered by a weak record -> air_loss.
         Sample::new(7, origin + 450_000).rssi(-80),
         Sample::new(8, origin + 600_000),
-        // Slot 7: contiguous counters and normal RSSI on both sides ->
-        // generator_missed.
+        // Slots 7 and 8: contiguous counters and normal RSSI on both sides ->
+        // generator_missed. The last record also lands in slot 8, which already
+        // holds one: an *extra* record, not a second covered slot.
         Sample::new(9, origin + 800_000),
-        // Slot 8 is filled by the last record; slot 9 has no closing record
-        // after it -> ambiguous.
         Sample::new(10, origin + 850_000),
-    ];    let data = prepare(&samples, origin, 10.0);
+    ];
+    let data = prepare(&samples, origin, 10.0);
     let trace = data.diagnostics.as_ref().expect("trace");
     let summary = &trace.summary;
 
-    // Covered span: slots 0..=9 of second 0, i.e. 7 filled + 5 empty.
+    // The span runs from the first record to the last one: 0.85 s times the
+    // 10 slots of a second, rounded once = 9 slots. Five of them received a
+    // record; the two that took a second record are *extra*, not coverage;
+    // the other four are gaps.
+    assert_eq!(summary.total_slots, 9);
     assert_eq!(summary.filled_records, 7);
-    assert_eq!(summary.empty_slots, 5);
-    assert_eq!(summary.total_slots, 12);
-    assert!((summary.loss_ratio - 5.0 / 12.0).abs() < 1e-12);
-
+    assert_eq!(summary.filled_slots, 5);
+    assert_eq!(summary.extra_records, 2);
+    assert_eq!(summary.empty_slots, 4);
+    assert!((summary.loss_ratio - 4.0 / 9.0).abs() < 1e-12);
     assert_eq!(summary.cause_counts.device_drop, 1);
     assert_eq!(summary.cause_counts.desktop_backpressure, 1);
     assert_eq!(summary.cause_counts.air_loss, 1);
     assert_eq!(summary.cause_counts.generator_missed, 1);
-    assert_eq!(summary.cause_counts.ambiguous, 1);
+    assert_eq!(summary.cause_counts.ambiguous, 0);
 
     // The five cause buckets partition the empty slots.
     let counted = summary.cause_counts.device_drop
@@ -720,4 +744,46 @@ fn capture_summary_aggregates_empty_slot_causes() {
     // The rest of the trace is untouched by the missing field.
     assert_eq!(restored_trace.records.len(), trace.records.len());
     assert_eq!(restored_trace.empty_slots.len(), trace.empty_slots.len());
+}
+
+#[test]
+fn declared_span_sets_the_slot_denominator() {
+    // The fixture is a ~5 s capture at ~100 PPS. A declared 9 s span at 10 slots
+    // a second must count 90 slots even though its records stop at 5 s: the
+    // denominator comes from the run, not from what happened to arrive.
+    let bytes = std::fs::read(rt_wireless_sensing::fixtures::capture_v8()).expect("fixture");
+    let data = VisualizationData::from_bytes_with_options(
+        &bytes,
+        Some("capture_v8.bin"),
+        VisualizationOptions {
+            nominal_pps: Some(10.0),
+            span_us: Some(9_000_000),
+            ..VisualizationOptions::default()
+        },
+    )
+    .expect("prepare");
+
+    let summary = &data.diagnostics.as_ref().expect("trace").summary;
+    assert_eq!(summary.total_slots, 90);
+    // `empty_slots` only enumerates the slots between records, so the two
+    // counts do not add up to the span here: the declared tail past the last
+    // record is a deficit the summary reports through `loss_ratio`, not one it
+    // invents a cause for.
+    assert!(
+        summary.filled_slots + summary.empty_slots <= summary.total_slots,
+        "the trace can never cover more slots than the run declares"
+    );
+    assert!(
+        summary.filled_records > summary.filled_slots,
+        "100 records over 10 slots a second cannot be one per slot"
+    );
+    assert_eq!(
+        summary.extra_records,
+        summary.filled_records - summary.filled_slots
+    );
+    assert!(
+        (0.0..=1.0).contains(&summary.loss_ratio),
+        "loss_ratio must stay a plain ratio, got {}",
+        summary.loss_ratio
+    );
 }

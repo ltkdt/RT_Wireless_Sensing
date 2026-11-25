@@ -26,6 +26,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::collection::{NominalPpsSource, TrafficGenerator};
 use crate::csi_header::{RAW_CSI_FLAG_FIRST_WORD_INVALID, RAW_CSI_FLAG_FRESH};
 use crate::decoder::{CsiPacket, DecodeError, FrameStreamDecoder};
 
@@ -66,6 +67,20 @@ pub struct VisualizationMetadata {
     /// [`VisualizationMetadata::effective_pps`].
     #[serde(default)]
     pub nominal_pps: Option<f64>,
+    /// Where [`Self::nominal_pps`] came from.
+    ///
+    /// `None` when nothing declared a rate, or when the payload predates this
+    /// field. Lets the dashboard tell a rate it may drive the occupancy grid
+    /// with (`argument`) from one that describes the device's own cadence.
+    #[serde(default)]
+    pub nominal_pps_source: Option<NominalPpsSource>,
+    /// Who produced the traffic this payload describes.
+    ///
+    /// `None` means unknown — an offline payload whose file name carries no
+    /// suffix, or one built by a tool with no device to ask. The dashboard then
+    /// renders the mode as `—` rather than guessing.
+    #[serde(default)]
+    pub traffic_mode: Option<TrafficGenerator>,
     /// Wi-Fi channel if available.
     pub channel: Option<u8>,
     /// Hex-formatted device identifier if available.
@@ -142,7 +157,11 @@ pub enum DiagnosticCause {
 }
 
 impl DiagnosticCause {
-    /// Layer this cause points at.
+    /// Layer this cause points at, when nothing is known about the traffic mode.
+    ///
+    /// This is the attribution for an external or unknown producer. When the
+    /// device generated the traffic itself, use [`layer_for`], which moves
+    /// [`Self::GeneratorMissed`] to [`DiagnosticLayer::RxDevice`].
     pub fn layer(self) -> DiagnosticLayer {
         match self {
             Self::DeviceDrop => DiagnosticLayer::RxDevice,
@@ -151,6 +170,29 @@ impl DiagnosticCause {
             Self::GeneratorMissed => DiagnosticLayer::Generator,
             Self::Ambiguous => DiagnosticLayer::Unknown,
         }
+    }
+}
+
+/// Layer a cause points at, given who produced the traffic.
+///
+/// The classification itself is mode-independent, and is deliberately left
+/// alone: a [`DiagnosticCause::GeneratorMissed`] slot really does have
+/// contiguous drop counters and zero dropped frames, whether the packets were
+/// missing from this process's marker loop or from the device's own generator.
+/// Only the *attribution* changes.
+///
+/// * Internal mode → the device owns the generator, so the missing records come
+///   from the device or its firmware: [`DiagnosticLayer::RxDevice`].
+/// * Anything else → unchanged, i.e. [`DiagnosticCause::layer`].
+pub fn layer_for(
+    cause: DiagnosticCause,
+    traffic_mode: Option<TrafficGenerator>,
+) -> DiagnosticLayer {
+    match (cause, traffic_mode) {
+        (DiagnosticCause::GeneratorMissed, Some(TrafficGenerator::Internal)) => {
+            DiagnosticLayer::RxDevice
+        }
+        (cause, _) => cause.layer(),
     }
 }
 
@@ -333,19 +375,27 @@ pub struct DiagnosticCauseCounts {
 
 /// Capture-level aggregation of the diagnostic trace.
 ///
-/// Covers the span from the first to the last received record only: slots
-/// before the first record and after the last one are not part of the capture,
-/// so they are neither filled nor empty. `ambiguous` therefore absorbs the
-/// capture edge and the live-window edge instead of distorting the attribution
-/// of the other causes.
+/// `total_slots` is the declared span of the run in slots, so it is the
+/// denominator of every ratio here: `filled_slots + empty_slots` partition it,
+/// and a run that ended early — or that never reached its own end — shows up as
+/// empty slots instead of disappearing from the count.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct DiagnosticSummary {
-    /// Covered span in slots: `filled_records + empty_slots`.
+    /// Slots the run was declared to cover: `round(span × slots / 1e6)`.
     pub total_slots: u64,
-    /// Records received inside the covered span.
+    /// Slots that received at least one record.
+    pub filled_slots: u64,
+    /// Records received inside the span.
     pub filled_records: u64,
-    /// Slots inside the covered span without a record.
+    /// `filled_records − filled_slots`: records that arrived in a slot another
+    /// record already filled, i.e. less than one slot apart from each other.
+    ///
+    /// `#[serde(default)]` keeps payloads written before this field existed
+    /// parseable; the web layer derives it from the other two when absent.
+    #[serde(default)]
+    pub extra_records: u64,
+    /// Slots inside the span without a record.
     pub empty_slots: u64,
     /// `empty_slots / total_slots`; `0.0` for an empty trace.
     pub loss_ratio: f64,
@@ -659,18 +709,38 @@ pub fn decode_packets(bytes: &[u8]) -> Result<Vec<CsiPacket>, VisualizationError
 ///
 /// `origin_ticks` is the `device_ticks_us` that maps to timestamp `0.0`, so the
 /// slot grid shares the time base of [`VisualizationData::timestamps`].
+/// # Counting slots
+///
+/// `span_ticks` is how far the run is declared to last: the recording span of a
+/// finished capture, or `latest − origin` for a live window. It replaces the
+/// old "first to last record" span, which could only ever describe what arrived
+/// and so could never show a deficit at the end of a run.
+///
+/// `total_slots` is that span rounded **once** to whole slots
+/// (`round(span_seconds × slots_per_second)`), so `5.006366 s` at 100 PPS is
+/// 501 slots and `5 s` is 500. `filled_slots` counts the slots that received at
+/// least one record, which is why it can be smaller than the record count:
+/// records that land in an already-filled slot are *extra*, not coverage.
+///
 /// `slots_per_second` is the nominal PPS rounded once by the caller.
 ///
 /// Slot assignment uses integer arithmetic on device ticks
 /// (`slot = within_second_us * slots / 1_000_000`), which is the exact form of
 /// the web occupancy formula `floor((t − second_start) * slots + 1e-6)`.
+///
+/// The trace is deliberately mode-blind: it records the evidence (cause,
+/// deltas, counters) and nothing about who produced the traffic. Attribution is
+/// [`layer_for`]'s job, applied when the payload is read, so an internal and an
+/// external capture of the same evidence serialize identically.
 fn build_diagnostic_trace(
     packets: &[CsiPacket],
     origin_ticks: u64,
     slots_per_second: usize,
     capture_end: bool,
+    span_ticks: u64,
 ) -> DiagnosticTrace {
-    let slots = slots_per_second.max(1);
+    let slots_per_second = slots_per_second.max(1);
+    let total_slots = slots_in_span(span_ticks, slots_per_second);
     let mut records = Vec::with_capacity(packets.len());
     let mut previous: Option<&CsiPacket> = None;
 
@@ -679,21 +749,30 @@ fn build_diagnostic_trace(
         let relative = ticks.saturating_sub(origin_ticks);
         let second = (relative / 1_000_000) as u32;
         let within = relative % 1_000_000;
-        let slot = (within * slots as u64 / 1_000_000) as u32;
-        let slot_start = u64::from(slot) * 1_000_000 / slots as u64;
+        let slot = (within * slots_per_second as u64 / 1_000_000) as u32;
+        let slot_start = u64::from(slot) * 1_000_000 / slots_per_second as u64;
         let slot_offset_us = within as i64 - slot_start as i64;
 
-        let delta_stream = previous
-            .map(|previous| packet.frame.stream_sequence.saturating_sub(previous.frame.stream_sequence));
-        let delta_drop = previous
-            .map(|previous| packet.frame.raw_drop_total.saturating_sub(previous.frame.raw_drop_total));
+        let delta_stream = previous.map(|previous| {
+            packet
+                .frame
+                .stream_sequence
+                .saturating_sub(previous.frame.stream_sequence)
+        });
+        let delta_drop = previous.map(|previous| {
+            packet
+                .frame
+                .raw_drop_total
+                .saturating_sub(previous.frame.raw_drop_total)
+        });
         let delta_backpressure = previous.map(|previous| {
             packet
                 .frame
                 .raw_send_backpressure_total
                 .saturating_sub(previous.frame.raw_send_backpressure_total)
         });
-        let delta_ticks_us = previous.map(|previous| ticks.saturating_sub(previous.csi.device_ticks_us));
+        let delta_ticks_us =
+            previous.map(|previous| ticks.saturating_sub(previous.csi.device_ticks_us));
         let delta_wifi_rx_us = previous.and_then(|previous| {
             match (
                 packet.csi.valid_wifi_rx_ts_us(),
@@ -731,12 +810,12 @@ fn build_diagnostic_trace(
         previous = Some(packet);
     }
 
-    let empty_slots = collect_empty_slots(&records, slots);
-    let seconds = collect_second_stats(&records, &empty_slots, slots);
-    let summary = collect_summary(&records, &empty_slots);
+    let empty_slots = collect_empty_slots(&records, slots_per_second, total_slots);
+    let seconds = collect_second_stats(&records, &empty_slots, slots_per_second);
+    let summary = collect_summary(&records, &empty_slots, total_slots);
 
     DiagnosticTrace {
-        slots_per_second: slots,
+        slots_per_second,
         origin_ticks,
         capture_end,
         records,
@@ -748,13 +827,16 @@ fn build_diagnostic_trace(
 
 /// Aggregate every empty slot of the trace into one [`DiagnosticSummary`].
 ///
-/// The covered span is `filled_records + empty_slots`: [`collect_empty_slots`]
-/// enumerates exactly the slots between the first and the last record, so the
-/// two counts partition it and `loss_ratio` describes the capture, not the
-/// wall-clock duration.
+/// `total_slots` comes from the declared span, not from the trace:
+/// `round(span_ticks × slots / 1e6)`. The two counts that partition it are
+/// `filled_slots` (slots that received a record) and `empty_slots`, so
+/// `loss_ratio` describes the run the operator asked for, including a deficit
+/// that no record would ever reveal. Records beyond the first in a slot are
+/// reported separately as [`DiagnosticSummary::extra_records`].
 fn collect_summary(
     records: &[DiagnosticRecord],
     empty_slots: &[DiagnosticEmptySlot],
+    total_slots: u64,
 ) -> DiagnosticSummary {
     let mut cause_counts = DiagnosticCauseCounts::default();
     let mut dropped_frames_total = 0u64;
@@ -781,8 +863,9 @@ fn collect_summary(
     }
 
     let filled_records = records.len() as u64;
+    let filled_slots = count_filled_slots(records);
     let empty_count = empty_slots.len() as u64;
-    let total_slots = filled_records + empty_count;
+    let total_slots = total_slots.max(filled_slots + empty_count);
     let loss_ratio = if total_slots == 0 {
         0.0
     } else {
@@ -791,7 +874,9 @@ fn collect_summary(
 
     DiagnosticSummary {
         total_slots,
+        filled_slots,
         filled_records,
+        extra_records: filled_records.saturating_sub(filled_slots),
         empty_slots: empty_count,
         loss_ratio,
         cause_counts,
@@ -802,15 +887,60 @@ fn collect_summary(
     }
 }
 
+/// Number of slots of `slots` columns that a span of `span_ticks` covers.
+///
+/// The span is converted once, in integer arithmetic, so the result does not
+/// depend on floating-point rounding: `round(ticks × slots / 1e6)` is
+/// `(ticks × slots + 500_000) / 1_000_000` for non-negative values.
+fn slots_in_span(span_ticks: u64, slots: usize) -> u64 {
+    let numerator = u128::from(span_ticks) * slots as u128 + 500_000;
+    u64::try_from(numerator / 1_000_000).unwrap_or(u64::MAX)
+}
+
+/// Count the slots that hold at least one record.
+///
+/// Records are sorted by `(second, slot)`, so a slot is filled exactly when it
+/// differs from the record before it.
+fn count_filled_slots(records: &[DiagnosticRecord]) -> u64 {
+    let mut filled = 0u64;
+    let mut previous: Option<(u32, u32)> = None;
+
+    for record in records {
+        let key = (record.second, record.slot);
+        if previous != Some(key) {
+            filled += 1;
+            previous = Some(key);
+        }
+    }
+    filled
+}
+
 /// Enumerate every slot without a record between the first and last record.
-fn collect_empty_slots(records: &[DiagnosticRecord], slots: usize) -> Vec<DiagnosticEmptySlot> {
+///
+/// The range stops at the last slot the span covers, so a capture never
+/// reports a slot that lies past the point it is declared to end at.
+fn collect_empty_slots(
+    records: &[DiagnosticRecord],
+    slots: usize,
+    total_slots: u64,
+) -> Vec<DiagnosticEmptySlot> {
     let (Some(first), Some(last)) = (records.first(), records.last()) else {
         return Vec::new();
     };
 
     let mut empty_slots = Vec::new();
     for second in first.second..=last.second {
-        for slot in 0..slots as u32 {
+        // Second `n` starts at slot `n × slots` of the span and owns `slots`
+        // columns; the last one may be cut short by the end of the span.
+        let first_slot = if second == first.second {
+            first.slot
+        } else {
+            0
+        };
+        let base = u64::from(second) * slots as u64;
+        let end_slot = total_slots.saturating_sub(base).min(slots as u64);
+
+        for slot in first_slot..end_slot as u32 {
             // Records are sorted by (second, slot), so the first record at or
             // after this slot is the closing boundary and the one before it is
             // the opening boundary.
@@ -855,7 +985,9 @@ fn classify_empty_slot(
         return (DiagnosticCause::Ambiguous, 0, 0, 0);
     };
 
-    let delta_stream = next.stream_sequence.saturating_sub(previous.stream_sequence);
+    let delta_stream = next
+        .stream_sequence
+        .saturating_sub(previous.stream_sequence);
     let delta_drop = next.delta_drop.unwrap_or(0);
     let delta_backpressure = next.delta_backpressure.unwrap_or(0);
 
@@ -963,9 +1095,8 @@ fn second_stats(
         .map(|delta| delta as f64)
         .collect();
     let mut sorted_intervals = intervals.clone();
-    sorted_intervals.sort_by(|left, right| {
-        left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    sorted_intervals
+        .sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
     let interval_mean_us = mean(&intervals);
 
     let offsets: Vec<f64> = records
@@ -1123,6 +1254,16 @@ pub struct VisualizationOptions {
     /// rate, which is wrong exactly for the seconds that miss samples — pass
     /// the configured `--pps` when preparing an offline file.
     pub nominal_pps: Option<f64>,
+    /// Where [`Self::nominal_pps`] came from, copied into the metadata.
+    ///
+    /// `None` for payloads with no provenance: offline runs and live sessions
+    /// that never resolved a rate.
+    pub nominal_pps_source: Option<NominalPpsSource>,
+    /// Who produced the traffic, copied into the metadata.
+    ///
+    /// `None` means unknown. `Some(TrafficGenerator::Internal)` also relabels
+    /// the `generator_missed` diagnostic cause (see [`layer_for`]).
+    pub traffic_mode: Option<TrafficGenerator>,
     /// `true` when `packets` ends at the end of the capture.
     ///
     /// A live dashboard publishes a sliding window, so its last record is not
@@ -1145,15 +1286,32 @@ pub struct VisualizationOptions {
     /// never computes it). `--no-dsp` sets this to `None` to keep the payload
     /// small; a live dashboard always uses `None`.
     pub dsp: Option<DspOptions>,
+    /// Declared span of the run in device microseconds, when it is known
+    /// independently of the records.
+    ///
+    /// The diagnostic summary divides this span into slots to get
+    /// `total_slots`. `None` means "as far as the records reach", which is
+    /// correct for an unlimited capture (the file ends at its last record) and
+    /// for a live window (it counts up to the newest published record).
+    ///
+    /// A `--duration` capture does not need it either: its file is cut at the
+    /// limit (see [`crate::collection`]), so `last − origin` already is the
+    /// span. Pass it only when the records deliberately stop before the span,
+    /// which is what happens when a shorter `--window` is served from a longer
+    /// recording.
+    pub span_us: Option<u64>,
 }
 
 impl Default for VisualizationOptions {
     fn default() -> Self {
         Self {
             nominal_pps: None,
+            nominal_pps_source: None,
+            traffic_mode: None,
             capture_end: true,
             diagnostics: true,
             dsp: Some(DspOptions::default()),
+            span_us: None,
         }
     }
 }
@@ -1228,6 +1386,7 @@ pub fn prepare_visualization_data_with_options(
     let mut timestamps = Vec::with_capacity(packets.len());
     let mut amplitudes = Vec::with_capacity(packets.len());
     let mut previous_ticks = origin_ticks;
+    let mut last_ticks = origin_ticks;
 
     for (record, packet) in packets.iter().enumerate() {
         let ticks = packet.csi.device_ticks_us;
@@ -1262,6 +1421,7 @@ pub fn prepare_visualization_data_with_options(
         timestamps.push(t_sec);
         amplitudes.push(packet.amplitudes());
         previous_ticks = ticks;
+        last_ticks = ticks;
     }
 
     let total_frames = packets.len();
@@ -1294,6 +1454,8 @@ pub fn prepare_visualization_data_with_options(
         subcarriers,
         effective_pps,
         nominal_pps,
+        nominal_pps_source: options.nominal_pps_source,
+        traffic_mode: options.traffic_mode,
         channel,
         device_id,
     };
@@ -1302,9 +1464,24 @@ pub fn prepare_visualization_data_with_options(
     // slot-grid column count is passed explicitly (nominal PPS rounded once
     // here) so the web UI does not re-derive it. Building the trace is opt-out:
     // a live dashboard leaves it disabled to keep the payload small.
+    //
+    // The span decides `total_slots`. A finished capture declares it up front
+    // (`--duration`, or the recording span when the run was unlimited); a live
+    // window only knows how far it has got, so it counts up to the newest
+    // record it publishes. Both cases fall back to `last − origin`, which is
+    // exactly what an unrecorded `--duration` means on a finished capture.
+    let span_ticks = options
+        .span_us
+        .unwrap_or_else(|| last_ticks.saturating_sub(origin_ticks));
     let diagnostics = options.diagnostics.then(|| {
         let slots_per_second = slot_pps.round().max(1.0) as usize;
-        build_diagnostic_trace(packets, origin_ticks, slots_per_second, options.capture_end)
+        build_diagnostic_trace(
+            packets,
+            origin_ticks,
+            slots_per_second,
+            options.capture_end,
+            span_ticks,
+        )
     });
 
     // The DSP view is computed once, here, from the same packets as the
@@ -1739,6 +1916,105 @@ pub async fn serve_dashboard_live_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- D14: the relabel touches attribution only -------------------------
+
+    #[test]
+    fn generator_missed_is_relabelled_in_internal_mode() {
+        use crate::collection::TrafficGenerator;
+
+        // External, or unknown, keeps today's attribution.
+        assert_eq!(
+            layer_for(DiagnosticCause::GeneratorMissed, None),
+            DiagnosticLayer::Generator
+        );
+        assert_eq!(
+            layer_for(
+                DiagnosticCause::GeneratorMissed,
+                Some(TrafficGenerator::External)
+            ),
+            DiagnosticLayer::Generator
+        );
+
+        // Internal: the device owns the generator, so the blame moves to it.
+        assert_eq!(
+            layer_for(
+                DiagnosticCause::GeneratorMissed,
+                Some(TrafficGenerator::Internal)
+            ),
+            DiagnosticLayer::RxDevice
+        );
+
+        // Every other cause is mode-blind: the counters it reads are recorded
+        // on the device regardless of who produced the traffic.
+        for cause in [
+            DiagnosticCause::DeviceDrop,
+            DiagnosticCause::DesktopBackpressure,
+            DiagnosticCause::AirLoss,
+            DiagnosticCause::Ambiguous,
+        ] {
+            assert_eq!(layer_for(cause, None), cause.layer());
+            assert_eq!(
+                layer_for(cause, Some(TrafficGenerator::Internal)),
+                cause.layer(),
+                "{cause:?} must not be relabelled by the traffic mode"
+            );
+        }
+    }
+
+    #[test]
+    fn traffic_mode_reaches_the_metadata_and_leaves_the_grid_alone() {
+        use crate::collection::{NominalPpsSource, TrafficGenerator};
+
+        let packets = capture_packets();
+        let origin = packets[0].csi.device_ticks_us;
+
+        let with_mode = |options: VisualizationOptions| {
+            prepare_visualization_data_with_options(
+                &packets,
+                Some("capture_v8_internal.bin"),
+                origin,
+                options,
+            )
+            .expect("capture should prepare")
+        };
+
+        let internal = with_mode(VisualizationOptions {
+            nominal_pps: Some(100.0),
+            nominal_pps_source: Some(NominalPpsSource::Device),
+            traffic_mode: Some(TrafficGenerator::Internal),
+            ..VisualizationOptions::default()
+        });
+        assert_eq!(
+            internal.metadata.traffic_mode,
+            Some(TrafficGenerator::Internal)
+        );
+        assert_eq!(
+            internal.metadata.nominal_pps_source,
+            Some(NominalPpsSource::Device)
+        );
+        assert_eq!(internal.metadata.nominal_pps, Some(100.0));
+
+        // The mode is display metadata: the slot grid is driven by the rate
+        // alone, so an identical rate gives an identical grid.
+        let external = with_mode(VisualizationOptions {
+            nominal_pps: Some(100.0),
+            nominal_pps_source: Some(NominalPpsSource::Argument),
+            traffic_mode: Some(TrafficGenerator::External),
+            ..VisualizationOptions::default()
+        });
+        assert_eq!(
+            internal
+                .diagnostics
+                .as_ref()
+                .map(|trace| trace.summary.clone()),
+            external
+                .diagnostics
+                .as_ref()
+                .map(|trace| trace.summary.clone()),
+            "the diagnostic evidence must be identical between modes"
+        );
+    }
 
     fn capture_packets() -> Vec<CsiPacket> {
         let path = crate::fixtures::capture_v8();

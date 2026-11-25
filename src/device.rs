@@ -49,6 +49,7 @@ use std::error::Error;
 use std::fmt;
 
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 
 /// Default HTTP `Origin` header expected by ESPectre.
 ///
@@ -62,8 +63,7 @@ pub const DEFAULT_ORIGIN: &str = "https://test.espectre.dev";
 ///
 /// Ordered as documented in `@espectre` `docs/API.md:104`. `Ping` is the
 /// factory default.
-pub const TRAFFIC_GENERATOR_MODES: [&str; 5] =
-    ["ping", "dns", "dns_tcp", "wifi_raw", "external"];
+pub const TRAFFIC_GENERATOR_MODES: [&str; 5] = ["ping", "dns", "dns_tcp", "wifi_raw", "external"];
 
 /// Who produces the traffic a capture records.
 ///
@@ -72,7 +72,8 @@ pub const TRAFFIC_GENERATOR_MODES: [&str; 5] =
 /// `external` means "the device generates its own traffic", which is why the
 /// classification is a method ([`DeviceStatus::is_internal`]) rather than a
 /// second enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TrafficGenerator {
     /// Another host (this crate) sends the traffic; the device sends nothing.
     ///
@@ -253,6 +254,15 @@ pub enum DeviceError {
         /// The rejected value.
         mode: String,
     },
+    /// The write was accepted but the device could not be re-read.
+    ///
+    /// Distinct from [`Self::Http`] because the outcome is genuinely unknown:
+    /// the change may or may not have been applied. Reporting it as a write
+    /// failure would be a false claim in the other direction.
+    Unconfirmed {
+        /// The mode that was written.
+        mode: String,
+    },
 }
 
 impl fmt::Display for DeviceError {
@@ -265,6 +275,11 @@ impl fmt::Display for DeviceError {
                 "unknown traffic generator mode {mode:?}; expected one of: {}",
                 TRAFFIC_GENERATOR_MODES.join(", ")
             ),
+            Self::Unconfirmed { mode } => write!(
+                f,
+                "the device accepted the change to {mode:?} but could not be re-read; \
+                 run --show to check the current mode"
+            ),
         }
     }
 }
@@ -273,7 +288,7 @@ impl Error for DeviceError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Http(error) => Some(error),
-            Self::Mismatch(_) | Self::UnknownMode { .. } => None,
+            Self::Mismatch(_) | Self::UnknownMode { .. } | Self::Unconfirmed { .. } => None,
         }
     }
 }
@@ -328,6 +343,8 @@ impl fmt::Display for Mismatch {
         }
     }
 }
+
+impl Error for Mismatch {}
 
 /// Check that the device is in the mode the run needs.
 ///
@@ -388,6 +405,8 @@ pub async fn set_traffic_generator_mode(
 
     let base = endpoint.base_url();
 
+    // The write itself. A failure here is reported verbatim: it means the
+    // device rejected or never received the change, not that it is unreadable.
     Client::new()
         .patch(format!("{base}/sensing"))
         .header("Origin", &endpoint.origin)
@@ -397,7 +416,11 @@ pub async fn set_traffic_generator_mode(
         .error_for_status()?;
 
     // Read-after-write: the PATCH response is an acknowledgement, not proof.
-    Ok(read(endpoint).await.unwrap_or_default())
+    // A failed re-read is its own error, because "wrote it but could not
+    // confirm" must not be reported as "the write did not take effect".
+    read(endpoint).await.ok_or(DeviceError::Unconfirmed {
+        mode: mode.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -542,6 +565,26 @@ mod tests {
     }
 
     #[test]
+    fn unconfirmed_is_distinct_from_a_write_failure() {
+        // "Wrote it but could not confirm" must not read like "the write
+        // failed": the operator's next step differs.
+        let unconfirmed = DeviceError::Unconfirmed {
+            mode: "ping".to_string(),
+        };
+        let message = unconfirmed.to_string();
+        assert!(message.contains("accepted"), "message: {message}");
+        assert!(
+            message.contains("could not be re-read"),
+            "message: {message}"
+        );
+        assert!(message.contains("--show"), "message: {message}");
+        assert!(
+            !message.contains("did not take effect"),
+            "message: {message}"
+        );
+    }
+
+    #[test]
     fn mismatch_message_names_both_sides() {
         let mismatch = Mismatch {
             actual: "external".to_string(),
@@ -586,5 +629,149 @@ mod tests {
         assert_eq!(TRAFFIC_GENERATOR_MODES.len(), 5);
         assert!(TRAFFIC_GENERATOR_MODES.contains(&"ping"));
         assert!(TRAFFIC_GENERATOR_MODES.contains(&"external"));
+    }
+
+    /// Serve exactly `count` requests sequentially, replying with `status` and
+    /// `body` to each.
+    ///
+    /// The listener is moved into the server thread, which does its own
+    /// blocking `accept`: accepting on the test thread would hold the runtime
+    /// and prevent the client from ever connecting.
+    ///
+    /// Returns a handle to the joined request heads, so the caller can assert
+    /// on method and path. A real socket is used rather than a mock HTTP layer
+    /// because the point is the wire behaviour of [`read`] and
+    /// [`set_traffic_generator_mode`], not their parsing alone.
+    fn serve(
+        listener: std::net::TcpListener,
+        status: &str,
+        body: &str,
+        count: usize,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        use std::io::{Read, Write};
+
+        let status = status.to_string();
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            let mut heads = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buffer = [0u8; 8192];
+                // Read the request head only; the client sends no body we need.
+                let read = stream.read(&mut buffer).expect("read request");
+                heads.push(String::from_utf8_lossy(&buffer[..read]).to_string());
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).expect("write reply");
+                stream.flush().expect("flush");
+            }
+            heads
+        })
+    }
+
+    #[test]
+    fn read_returns_the_parsed_status() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = serve(listener, "200 OK", SENSING_BODY, 1);
+
+        let endpoint = DeviceEndpoint::new("127.0.0.1", port, DEFAULT_ORIGIN);
+        let status = block_on(read(&endpoint)).expect("status");
+
+        assert_eq!(status.traffic_generator_mode.as_deref(), Some("ping"));
+        assert_eq!(status.csi_target_pps, Some(100));
+
+        let request = &server.join().expect("server")[0];
+        assert!(request.starts_with("GET /espectre/v1/sensing"), "{request}");
+        assert!(
+            request.contains(&format!("origin: {DEFAULT_ORIGIN}"))
+                || request.contains(&format!("Origin: {DEFAULT_ORIGIN}")),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn read_is_none_on_a_non_success_status() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = serve(listener, "500 Internal Server Error", "{}", 1);
+
+        let endpoint = DeviceEndpoint::new("127.0.0.1", port, DEFAULT_ORIGIN);
+        assert_eq!(block_on(read(&endpoint)), None);
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn set_patches_then_re_reads() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+
+        // Exchange 1 is the PATCH; exchange 2 is the confirming re-read, which
+        // reports the new mode. Both are served by one thread, in order.
+        let confirmed = SENSING_BODY.replace("\"ping\"", "\"external\"");
+        let server = serve(listener, "200 OK", &confirmed, 2);
+
+        let endpoint = DeviceEndpoint::new("127.0.0.1", port, DEFAULT_ORIGIN);
+        let status = block_on(set_traffic_generator_mode(&endpoint, "external")).expect("status");
+
+        let heads = server.join().expect("server");
+
+        assert!(
+            heads[0].starts_with("PATCH /espectre/v1/sensing"),
+            "{}",
+            heads[0]
+        );
+        assert!(
+            heads[0].contains("\"traffic_generator_mode\":\"external\""),
+            "{}",
+            heads[0]
+        );
+        assert!(
+            heads[1].starts_with("GET /espectre/v1/sensing"),
+            "{}",
+            heads[1]
+        );
+
+        // The returned status is the re-read, not the PATCH response.
+        assert_eq!(status.traffic_generator_mode.as_deref(), Some("external"));
+    }
+
+    #[test]
+    fn set_rejects_an_unknown_mode_without_sending_anything() {
+        // Nothing should ever connect to this listener.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("non-blocking probe allowed");
+
+        let endpoint = DeviceEndpoint::new("127.0.0.1", port, DEFAULT_ORIGIN);
+        let error = block_on(set_traffic_generator_mode(&endpoint, "pacing"))
+            .expect_err("unknown mode must be rejected");
+
+        assert!(
+            matches!(error, DeviceError::UnknownMode { .. }),
+            "{error:?}"
+        );
+        assert!(
+            listener.accept().is_err(),
+            "an unknown mode must not open a connection"
+        );
+    }
+
+    /// Run a future to completion on the current thread.
+    ///
+    /// These tests need a real socket. A tiny local runtime keeps the
+    /// dependency surface unchanged: `#[tokio::test]` would pull the macro's
+    /// features into every build, while `tokio` itself is already a dependency.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(future)
     }
 }
