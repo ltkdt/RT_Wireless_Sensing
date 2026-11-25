@@ -100,10 +100,19 @@ every poll.
 - **Tooltips:** hovering a KPI, a legend row or the ⓘ glyph explains the
   underlying payload field.
 
-Percentages are over the empty slots inside the **covered span** — from the first
-to the last received record. Slots before the first record and after the last one
-are not part of the capture, so they are neither filled nor empty; `capture_end`
-and `seconds[].partial` mark those edges.
+Percentages are over the empty slots inside the **span of the run**, which is the
+declared span when `--duration` was given and the recorded span otherwise. The
+span is rounded **once** into an integer number of slots
+(`round(span_seconds × slots_per_second)`), so `5.006 s` at 100 PPS is 501 slots
+and `--duration 5` is 500. `filled_slots` counts the slots that received at least
+one record and `empty_slots` the rest, so the two always add up to `total_slots`.
+
+Records that arrived after the span (a deadline stops the reader, not the writer)
+are still in `records[]` but have no slot of their own: they are not coverage, so
+they are not part of `filled_slots` and are reported once as
+`records_past_span`. `summary.extra_records = filled_records − filled_slots`
+counts the different case — records that landed in a slot another record already
+filled. Edges are marked by `capture_end` and `seconds[].partial`.
 
 #### Payload
 
@@ -115,7 +124,8 @@ and `seconds[].partial` mark those edges.
 | `records[]` | One row per received record: slot, slot offset, Δstream, Δdrop, Δbackpressure, Δticks, Δwifi_rx, RSSI/noise/SNR, flags, channel/PHY/width |
 | `empty_slots[]` | One row per slot without a record: cause, dropped frames, boundary records |
 | `seconds[]` | Per-second statistics: counts, Δtick intervals, bursts, slot offsets, layer counters, radio quality, anomalies |
-| `summary` | Capture-level aggregation for the overview panel: `total_slots`, `filled_records`, `empty_slots`, `loss_ratio`, `cause_counts`, `dropped_frames_total`, `delta_drop_total`, `delta_backpressure_total`, `empty_slots_low_rssi` |
+| `records_past_span` | Records that arrived after the declared span; they are in `records[]` but have no slot of their own, so they are not coverage |
+| `summary` | Capture-level aggregation for the overview panel: `total_slots` (`round(span × slots_per_second)`, from `--duration` when given), `filled_slots`, `filled_records`, `extra_records`, `empty_slots`, `loss_ratio`, `cause_counts`, `dropped_frames_total`, `delta_drop_total`, `delta_backpressure_total`, `empty_slots_low_rssi` |
 
 `summary` is `#[serde(default)]`: a payload written before the field existed
 still parses, and the web layer then aggregates `empty_slots` itself.
@@ -284,6 +294,9 @@ cargo run --bin visualize -- capture_v8.bin --json csi_data.json
 
 # Launch embedded asynchronous web server
 cargo run --bin visualize -- capture_v8.bin --serve --port 8080
+
+# Count slots over the 5 s that were requested, not over the 5.006 s recorded
+cargo run --bin visualize -- capture_v8_internal.bin --pps 100 --duration 5
 ```
 
 ### CLI options
@@ -294,6 +307,7 @@ cargo run --bin visualize -- capture_v8.bin --serve --port 8080
 | `-o, --output FILE` | Destination path for standalone HTML dashboard (default: `<stem>_heatmap.html`) |
 | `--json FILE` | Path to export JSON visualization data |
 | `--pps PPS` | Nominal packet rate, shown as **Nominal** in the UI, used for the diagnostic/occupancy slot grids and the DSP grid. Without it `metadata.nominal_pps` is `null`, the UI shows the default nominal rate (20 PPS), and the DSP grid uses the measured rate |
+| `--duration DUR` | Span of the run that was asked for, in `5`, `5s`, `500ms` or `1m` form. It sets `total_slots = round(span × slots/s)`, so `--duration 5 --pps 100` reports 500 slots even when the recorder overshot its deadline. Without it the span is the recorded one. The capture file is never truncated: records past the span stay in the payload and are counted as `records_past_span` |
 | `--no-dsp` | Skip the precomputed DSP view to keep the payload small; the DSP toggle stays hidden |
 | `--dsp-interp M` | Resampling interpolation: `nearest`, `linear` or `cubic` (default: `cubic`) |
 | `--dsp-norm S` | Normalization applied on top of the resampling: `none`, `per-subcarrier`, `per-sample` or `min-max` (default: `none`) |

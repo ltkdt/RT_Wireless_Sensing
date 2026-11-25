@@ -85,6 +85,17 @@ pub struct VisualizationMetadata {
     pub channel: Option<u8>,
     /// Hex-formatted device identifier if available.
     pub device_id: Option<String>,
+    /// Span the run was declared to cover, in seconds, when that differs from
+    /// where the records stop.
+    ///
+    /// `None` means the payload speaks for itself: the capture ended at its
+    /// last record. `Some` is set by `--duration` on an offline payload, where
+    /// the recording was asked to run for a fixed time and the file may hold a
+    /// record or two past that point — the deadline stops the reader, not the
+    /// device. The diagnostic grid divides *this* span into slots, so a 5 s run
+    /// at 100 PPS reads 500 slots even though the file holds 501 records.
+    #[serde(default)]
+    pub declared_span_seconds: Option<f64>,
 }
 
 /// Placeholder structure for activity or gesture classification results.
@@ -435,6 +446,17 @@ pub struct DiagnosticTrace {
     pub empty_slots: Vec<DiagnosticEmptySlot>,
     /// Per-second statistics, one row per second covered by the trace.
     pub seconds: Vec<DiagnosticSecondStats>,
+    /// Slots past the declared span that still hold a record.
+    ///
+    /// `total_slots` describes the run the operator asked for, so records that
+    /// arrived after it are not part of `filled_slots` and not part of the
+    /// denominator; they are counted here instead. `0` when the payload has no
+    /// declared span or the records end inside it.
+    ///
+    /// `#[serde(default)]` keeps payloads written before this field existed
+    /// parseable.
+    #[serde(default)]
+    pub records_past_span: u64,
     /// Capture-level aggregation of the empty slots, for the overview panel.
     ///
     /// `#[serde(default)]` keeps payloads written before this field existed
@@ -742,17 +764,27 @@ fn build_diagnostic_trace(
     let slots_per_second = slots_per_second.max(1);
     let total_slots = slots_in_span(span_ticks, slots_per_second);
     let mut records = Vec::with_capacity(packets.len());
+    // The deadline stops the reader, so a fixed-length capture can carry a
+    // record or two past its limit. They still land in the grid, like every
+    // other record; they are only counted here because they have no slot of
+    // their own within the span and so are not coverage either.
+    let mut records_past_span = 0u64;
     let mut previous: Option<&CsiPacket> = None;
 
     for (frame, packet) in packets.iter().enumerate() {
         let ticks = packet.csi.device_ticks_us;
         let relative = ticks.saturating_sub(origin_ticks);
+        if span_ticks > 0 && relative >= span_ticks {
+            records_past_span += 1;
+        }
         let second = (relative / 1_000_000) as u32;
         let within = relative % 1_000_000;
         let slot = (within * slots_per_second as u64 / 1_000_000) as u32;
         let slot_start = u64::from(slot) * 1_000_000 / slots_per_second as u64;
         let slot_offset_us = within as i64 - slot_start as i64;
 
+        // Deltas are against the previous record of the grid, whatever its
+        // slot: a gap is a property of the stream, not of the span.
         let delta_stream = previous.map(|previous| {
             packet
                 .frame
@@ -812,7 +844,7 @@ fn build_diagnostic_trace(
 
     let empty_slots = collect_empty_slots(&records, slots_per_second, total_slots);
     let seconds = collect_second_stats(&records, &empty_slots, slots_per_second);
-    let summary = collect_summary(&records, &empty_slots, total_slots);
+    let summary = collect_summary(&records, &empty_slots, total_slots, slots_per_second);
 
     DiagnosticTrace {
         slots_per_second,
@@ -821,6 +853,7 @@ fn build_diagnostic_trace(
         records,
         empty_slots,
         seconds,
+        records_past_span,
         summary,
     }
 }
@@ -837,6 +870,7 @@ fn collect_summary(
     records: &[DiagnosticRecord],
     empty_slots: &[DiagnosticEmptySlot],
     total_slots: u64,
+    slots: usize,
 ) -> DiagnosticSummary {
     let mut cause_counts = DiagnosticCauseCounts::default();
     let mut dropped_frames_total = 0u64;
@@ -863,7 +897,7 @@ fn collect_summary(
     }
 
     let filled_records = records.len() as u64;
-    let filled_slots = count_filled_slots(records);
+    let filled_slots = count_filled_slots(records, total_slots, slots);
     let empty_count = empty_slots.len() as u64;
     let total_slots = total_slots.max(filled_slots + empty_count);
     let loss_ratio = if total_slots == 0 {
@@ -901,11 +935,23 @@ fn slots_in_span(span_ticks: u64, slots: usize) -> u64 {
 ///
 /// Records are sorted by `(second, slot)`, so a slot is filled exactly when it
 /// differs from the record before it.
-fn count_filled_slots(records: &[DiagnosticRecord]) -> u64 {
+/// Number of distinct slots of the span that received at least one record.
+///
+/// A record may sit past the span, where there is no slot of its own: it is
+/// beyond the last column the grid can reach, so it is not coverage.
+fn count_filled_slots(records: &[DiagnosticRecord], total_slots: u64, slots: usize) -> u64 {
     let mut filled = 0u64;
     let mut previous: Option<(u32, u32)> = None;
 
     for record in records {
+        // The last second is the only one the span can cut short, so it is the
+        // only one that needs the extra comparison.
+        let second_base = u64::from(record.second) * slots as u64;
+        let beyond_span =
+            second_base >= total_slots || second_base + u64::from(record.slot) >= total_slots;
+        if beyond_span {
+            continue;
+        }
         let key = (record.second, record.slot);
         if previous != Some(key) {
             filled += 1;
@@ -1089,6 +1135,9 @@ fn second_stats(
         }
     }
 
+    // Intervals are between records of this second. A single record has none,
+    // and a previous record in another second is not a gap inside this one:
+    // its delta describes the boundary between the two, not a hole here.
     let intervals: Vec<f64> = records
         .iter()
         .filter_map(|record| record.delta_ticks_us)
@@ -1387,6 +1436,9 @@ pub fn prepare_visualization_data_with_options(
     let mut amplitudes = Vec::with_capacity(packets.len());
     let mut previous_ticks = origin_ticks;
     let mut last_ticks = origin_ticks;
+    // Denominator span of the run, when one was declared. `--duration` fixes
+    // it up front; a payload with no declaration derives it from the records.
+    let declared_span_ticks = options.span_us;
 
     for (record, packet) in packets.iter().enumerate() {
         let ticks = packet.csi.device_ticks_us;
@@ -1458,6 +1510,7 @@ pub fn prepare_visualization_data_with_options(
         traffic_mode: options.traffic_mode,
         channel,
         device_id,
+        declared_span_seconds: options.span_us.map(|span| span as f64 / 1_000_000.0),
     };
 
     // The diagnostic toggle is gated on the presence of this field, and the
@@ -1470,8 +1523,7 @@ pub fn prepare_visualization_data_with_options(
     // window only knows how far it has got, so it counts up to the newest
     // record it publishes. Both cases fall back to `last − origin`, which is
     // exactly what an unrecorded `--duration` means on a finished capture.
-    let span_ticks = options
-        .span_us
+    let span_ticks = declared_span_ticks
         .unwrap_or_else(|| last_ticks.saturating_sub(origin_ticks));
     let diagnostics = options.diagnostics.then(|| {
         let slots_per_second = slot_pps.round().max(1.0) as usize;

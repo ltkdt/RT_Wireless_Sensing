@@ -97,10 +97,19 @@ không cần chọn giây, và làm mới theo mỗi lần poll.
 - **Tooltip:** di chuột lên một KPI, một dòng chú giải hoặc ký hiệu ⓘ sẽ giải
   thích trường payload tương ứng.
 
-Phần trăm được tính trên các khe trống nằm trong **khoảng phủ** — từ bản ghi đầu
-tiên đến bản ghi cuối cùng. Các khe trước bản ghi đầu và sau bản ghi cuối không
-thuộc capture, nên không được tính là đầy hay trống; `capture_end` và
-`seconds[].partial` đánh dấu các biên đó.
+Phần trăm được tính trên các khe trống nằm trong **khoảng của lần chạy**: khoảng
+được khai báo khi có `--duration`, ngược lại là khoảng đã ghi. Khoảng này được làm
+tròn **một lần** thành số khe nguyên (`round(khoảng_giây × slots_per_second)`), nên
+`5.006 s` ở 100 PPS là 501 khe còn `--duration 5` là 500. `filled_slots` đếm các
+khe nhận ít nhất một bản ghi và `empty_slots` là phần còn lại, nên hai giá trị luôn
+cộng lại đúng `total_slots`.
+
+Các bản ghi đến sau khoảng (hạn chót dừng phần đọc, không dừng phần ghi) vẫn nằm
+trong `records[]` nhưng không có khe riêng: chúng không phải độ phủ, nên không
+thuộc `filled_slots` và được báo một lần qua `records_past_span`.
+`summary.extra_records = filled_records − filled_slots` đếm trường hợp khác — bản
+ghi rơi vào một khe đã có bản ghi khác. Các biên được đánh dấu bởi `capture_end`
+và `seconds[].partial`.
 
 #### Payload
 
@@ -112,7 +121,8 @@ thuộc capture, nên không được tính là đầy hay trống; `capture_end
 | `records[]` | Một dòng cho mỗi bản ghi nhận được: khe, độ lệch khe, Δstream, Δdrop, Δbackpressure, Δticks, Δwifi_rx, RSSI/noise/SNR, flags, kênh/PHY/độ rộng |
 | `empty_slots[]` | Một dòng cho mỗi khe không có bản ghi: nguyên nhân, số khung bị mất, bản ghi biên |
 | `seconds[]` | Thống kê từng giây: số lượng, khoảng Δtick, cụm trống, độ lệch khe, bộ đếm theo tầng, chất lượng vô tuyến, bất thường |
-| `summary` | Tổng hợp cấp capture cho bảng tổng quan: `total_slots`, `filled_records`, `empty_slots`, `loss_ratio`, `cause_counts`, `dropped_frames_total`, `delta_drop_total`, `delta_backpressure_total`, `empty_slots_low_rssi` |
+| `records_past_span` | Số bản ghi đến sau khoảng đã khai báo; chúng có trong `records[]` nhưng không có khe riêng nên không phải độ phủ |
+| `summary` | Tổng hợp cấp capture cho bảng tổng quan: `total_slots` (`round(khoảng × slots_per_second)`, lấy từ `--duration` khi có), `filled_slots`, `filled_records`, `extra_records`, `empty_slots`, `loss_ratio`, `cause_counts`, `dropped_frames_total`, `delta_drop_total`, `delta_backpressure_total`, `empty_slots_low_rssi` |
 
 `summary` mang `#[serde(default)]`: payload được ghi trước khi trường này tồn tại
 vẫn parse được, và khi đó lớp web tự gộp `empty_slots`.
@@ -279,6 +289,9 @@ cargo run --bin visualize -- capture_v8.bin --json csi_data.json
 
 # Khởi động máy chủ web nhúng không đồng bộ
 cargo run --bin visualize -- capture_v8.bin --serve --port 8080
+
+# Đếm khe trên đúng 5 s đã yêu cầu, không phải 5.006 s đã ghi
+cargo run --bin visualize -- capture_v8_internal.bin --pps 100 --duration 5
 ```
 
 ### Tùy chọn CLI
@@ -289,6 +302,7 @@ cargo run --bin visualize -- capture_v8.bin --serve --port 8080
 | `-o, --output FILE` | Đường dẫn đích cho bảng điều khiển HTML độc lập (mặc định: `<stem>_heatmap.html`) |
 | `--json FILE` | Đường dẫn xuất dữ liệu hiển thị JSON |
 | `--pps PPS` | Tốc độ gói danh định, hiển thị là **Nominal** trên UI, dùng cho lưới khe chẩn đoán/độ chiếm chỗ và lưới DSP. Không truyền thì `metadata.nominal_pps` là `null`, UI hiển thị tốc độ danh định mặc định (20 PPS), và lưới DSP dùng tốc độ đo được |
+| `--duration DUR` | Khoảng của lần chạy được yêu cầu, viết dạng `5`, `5s`, `500ms` hoặc `1m`. Nó đặt `total_slots = round(khoảng × slots/s)`, nên `--duration 5 --pps 100` báo 500 khe dù phần ghi có vượt hạn chót. Không truyền thì dùng khoảng đã ghi. Tệp capture không bao giờ bị cắt: bản ghi sau khoảng vẫn ở trong payload và được đếm vào `records_past_span` |
 | `--no-dsp` | Bỏ qua DSP view tính sẵn để giữ payload nhỏ; công tắc DSP vẫn ẩn |
 | `--dsp-interp M` | Phương pháp nội suy khi tái lấy mẫu: `nearest`, `linear` hoặc `cubic` (mặc định: `cubic`) |
 | `--dsp-norm S` | Chuẩn hóa áp dụng chồng lên kết quả tái lấy mẫu: `none`, `per-subcarrier`, `per-sample` hoặc `min-max` (mặc định: `none`) |

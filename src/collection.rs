@@ -56,8 +56,6 @@ use tokio::{
     time::{interval, sleep},
 };
 
-use crate::csi_header::CSI_HEADER_LEN;
-use crate::decoder::{HTTP_FRAME_PREFIX_LEN, HttpFrameHeader};
 use crate::device::{self, DeviceEndpoint, DeviceStatus};
 
 pub use crate::device::TrafficGenerator;
@@ -585,19 +583,6 @@ where
 ///
 /// After each chunk is written, `on_chunk` is called with the same bytes.
 ///
-/// # Where a `max_duration` run ends
-///
-/// The output file stops at the last record whose device timestamp is still
-/// **strictly before** `max_duration`, measured from the first record of the
-/// session. Records past that point are neither written nor passed to
-/// `on_chunk`: a capture declares its own span, so a visualiser reading the
-/// file alone never has to guess where the run was supposed to stop. A 5 s run
-/// therefore holds 500 records, not 501.
-///
-/// The cut needs the device ticks, which only a decoded frame carries, so the
-/// chunks are scanned with a private [`FrameStreamDecoder`]. The scan never
-/// fails the run: a malformed frame simply ends the scanning, and the trailing
-/// timer keeps a broken stream from being recorded forever.
 async fn stream_to_file<F>(
     config: &CollectionConfig,
     client: &Client,
@@ -619,10 +604,6 @@ where
     let mut file = tokio::fs::File::create(config.resolved_output()).await?;
     let mut total = 0u64;
     let mut deadline = config.max_duration.map(|max| Box::pin(sleep(max)));
-    let mut cut = config
-        .max_duration
-        .map(|max| DurationCut::new(max.as_micros() as u64));
-
     loop {
         let next = stream.next();
         let chunk = match deadline.as_mut() {
@@ -634,171 +615,17 @@ where
         };
         let Some(chunk) = chunk else { break };
         let chunk = chunk?;
-
-        // Where inside the chunk the records stop being part of the run.
-        // `accept` reports how much of `chunk` follows the bytes it already
-        // held, so the write covers the new bytes only and never a frame twice.
-        let keep = match cut.as_mut() {
-            Some(cut) => chunk.len() - cut.accept(&chunk),
-            None => chunk.len(),
-        };
-        let written = &chunk[chunk.len() - keep..];
-
-        if !written.is_empty() {
-            file.write_all(written).await?;
-            total += written.len() as u64;
-            on_chunk(written);
-            if config.verbose {
-                eprintln!("Received {total} bytes");
-            }
-        }
-
-        // The cut is final once a record `>= max_duration` arrived, whether it
-        // was inside this chunk or the chunk carried the whole tail.
-        if cut.as_ref().is_some_and(DurationCut::is_reached) {
-            break;
+        file.write_all(&chunk).await?;
+        total += chunk.len() as u64;
+        on_chunk(&chunk);
+        if config.verbose {
+            eprintln!("Received {total} bytes");
         }
     }
 
-    // The deadline, not the stream, ends a run: whatever the last chunk held
-    // back is a truncated tail, which belongs in the file exactly as received.
-    let rest = cut.as_ref().map(DurationCut::flush).unwrap_or(&[]);
-    if !rest.is_empty() {
-        file.write_all(rest).await?;
-        total += rest.len() as u64;
-        on_chunk(rest);
-    }
     file.flush().await?;
 
     Ok((total, started.elapsed()))
-}
-
-/// Finds the byte offset in the stream where a `max_duration` run ends.
-///
-/// The comparison is done on device ticks, not on the wall clock, so the
-/// result does not depend on prompt-delivered chunks, TCP scheduling, or how
-/// much the host slept between reads. The first decoded frame defines the
-/// origin; a record is kept when `ticks - origin < max_ticks`.
-///
-/// The cut never sees a record twice, and the file it produces ends on a frame
-/// boundary: a frame that straddles the limit is dropped whole rather than
-/// half-written, because half a record is not a shorter record.
-struct DurationCut {
-    /// The limit, converted from [`CollectionConfig::max_duration`].
-    max_ticks: u64,
-    /// Device ticks of the first record seen, once one was decoded.
-    origin_ticks: Option<u64>,
-    /// Set once a record at or past the limit was found: the run ends here.
-    reached: bool,
-    /// Bytes held back from the previous chunk because the frame they start is
-    /// not complete yet. They are settled by the next [`Self::accept`] or
-    /// returned by [`Self::flush`].
-    carry: Vec<u8>,
-}
-
-impl DurationCut {
-    fn new(max_ticks: u64) -> Self {
-        Self {
-            max_ticks,
-            origin_ticks: None,
-            reached: false,
-            carry: Vec::new(),
-        }
-    }
-
-    /// Whether the cut has already been found.
-    fn is_reached(&self) -> bool {
-        self.reached
-    }
-
-    /// Return the number of leading bytes of `chunk` that belong to the run.
-    ///
-    /// The caller writes `chunk[..keep]`; the bytes after that index are not
-    /// written now, because they are not settled yet. A frame that the chunk
-    /// does not contain entirely sits at that boundary: it is moved into the
-    /// carry buffer so the next call can judge it in one piece.
-    ///
-    /// The count always sits on a frame boundary. When a complete frame is at
-    /// or past the limit, `reached` is set and the count stops just before it,
-    /// so a frame straddling the limit is dropped whole.
-    fn accept(&mut self, chunk: &[u8]) -> usize {
-        // Frame boundaries are positions inside `frame_stream`, which starts
-        // with the carry, so a position there is a position in the run.
-        let mut frame_stream = std::mem::take(&mut self.carry);
-        let held = frame_stream.len();
-        frame_stream.extend_from_slice(chunk);
-
-        let mut settled = 0;
-        while settled + HTTP_FRAME_PREFIX_LEN <= frame_stream.len() {
-            // A malformed prefix cannot be sized, so it also cannot be placed
-            // on the timeline: stop settling and let the caller end the run.
-            let Ok(prefix) =
-                HttpFrameHeader::parse(&frame_stream[settled..][..HTTP_FRAME_PREFIX_LEN], 0)
-            else {
-                break;
-            };
-            let frame_len = prefix.frame_len();
-            if frame_len > frame_stream.len() - settled {
-                // The frame runs past this chunk; the next one settles it.
-                break;
-            }
-
-            // Only read the device tick: a frame this cut has to drop is often
-            // the first one whose counters or payload are inconsistent, and
-            // accepting only fully valid records would keep frames past the
-            // limit instead of dropping them.
-            let Some(ticks) = read_device_ticks(&frame_stream[settled..][..frame_len]) else {
-                break;
-            };
-
-            let origin = *self.origin_ticks.get_or_insert(ticks);
-            if ticks.saturating_sub(origin) >= self.max_ticks {
-                // This record and everything after it are past the run.
-                self.reached = true;
-                break;
-            }
-            settled += frame_len;
-        }
-
-        // Whatever is past `settled` is either the start of a frame the next
-        // chunk completes, or the tail past the limit that `flush` withholds.
-        self.carry = frame_stream.split_off(settled);
-        // The carry may start before this chunk did, and those bytes were
-        // already written by an earlier call, so only the part that came from
-        // `chunk` counts as settled now.
-        settled.saturating_sub(held)
-    }
-
-    /// Bytes still held back when the stream ends.
-    ///
-    /// They never formed a complete frame, so they belong to the run unless the
-    /// cut fired first; when the deadline ended the run, a truncated tail is
-    /// exactly what the deadline produces and it is written as received.
-    fn flush(&self) -> &[u8] {
-        if self.reached {
-            &[]
-        } else {
-            &self.carry
-        }
-    }
-}
-
-/// Device ticks of the record in `frame`, or `None` when the record cannot be
-/// located.
-///
-/// The cut only needs `device_ticks_us`, so it reads that single field instead
-/// of decoding the record: the frame at the limit is often the first one whose
-/// counters or payload are inconsistent, and those records still have to be
-/// recognised (to be dropped) rather than treated as the end of the timeline.
-fn read_device_ticks(frame: &[u8]) -> Option<u64> {
-    let record = frame.get(HTTP_FRAME_PREFIX_LEN..)?;
-    if record.len() < usize::from(CSI_HEADER_LEN) {
-        return None;
-    }
-    // Layout: <HBBBBIHHQQIQBbbQIIBBB>; `device_ticks_us` is the u64 at byte 20.
-    const DEVICE_TICKS_OFFSET: usize = 20;
-    let bytes = record.get(DEVICE_TICKS_OFFSET..DEVICE_TICKS_OFFSET + 8)?;
-    Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
 impl CollectionSummary {
@@ -835,137 +662,6 @@ impl CollectionSummary {
 }
 
 
-
-#[cfg(test)]
-mod duration_cut_tests {
-    use super::DurationCut;
-    use crate::csi_header::{CSI_HEADER_LEN, RAW_CSI_RECORD_MAGIC, RAW_CSI_RECORD_VERSION_V8};
-    use crate::decoder::{HTTP_FRAME_PREFIX_LEN, HTTP_FRAME_PREFIX_LEN_U16};
-
-    /// How many frames the synthetic streams carry.
-    const FRAMES: u64 = 8;
-
-    /// Build one synthetic frame with `payload` bytes of CSI.
-    ///
-    /// Only `device_ticks_us` matters to the cut and the frame is never decoded
-    /// here, so the prefix only has to be long enough to be sized.
-    fn frame(ticks_us: u64, sequence: u64, payload: usize) -> Vec<u8> {
-        let mut bytes = vec![0u8; HTTP_FRAME_PREFIX_LEN + CSI_HEADER_LEN as usize + payload];
-        let record_len = u16::from(CSI_HEADER_LEN) + payload as u16;
-
-        bytes[6..8].copy_from_slice(&HTTP_FRAME_PREFIX_LEN_U16.to_le_bytes());
-        bytes[24..32].copy_from_slice(&sequence.to_le_bytes());
-        bytes[32..34].copy_from_slice(&record_len.to_le_bytes());
-
-        let record = HTTP_FRAME_PREFIX_LEN;
-        bytes[record..record + 2].copy_from_slice(&RAW_CSI_RECORD_MAGIC.to_le_bytes());
-        bytes[record + 2] = RAW_CSI_RECORD_VERSION_V8;
-        bytes[record + 3] = CSI_HEADER_LEN;
-        // `device_ticks_us` is the u64 at byte 20 of the record header.
-        bytes[record + 20..record + 28].copy_from_slice(&ticks_us.to_le_bytes());
-        bytes
-    }
-
-    /// A stream of `FRAMES` frames, `step_us` apart, starting at tick 0.
-    fn stream(step_us: u64) -> Vec<u8> {
-        (0..FRAMES)
-            .map(|index| frame(index * step_us, index + 1, 64))
-            .flatten()
-            .collect()
-    }
-
-    /// Feed `stream` to the cut in chunks of `chunk_len` bytes and return the
-    /// bytes a capture would contain, mirroring `stream_to_file`.
-    /// Feed `stream` to the cut in chunks of `chunk_len` bytes and return the
-    /// bytes a capture would contain, mirroring `stream_to_file`.
-    fn run(cut: &mut DurationCut, stream: &[u8], chunk_len: usize) -> Vec<u8> {
-        let mut kept = Vec::new();
-        for chunk in stream.chunks(chunk_len) {
-            // `accept` returns how many leading bytes of `chunk` are settled and
-            // inside the run, so the write covers those and never the carry twice.
-            kept.extend_from_slice(&chunk[..cut.accept(chunk)]);
-            if cut.is_reached() {
-                break;
-            }
-        }
-        kept.extend_from_slice(cut.flush());
-        kept
-    }
-    #[test]
-    fn cut_keeps_records_strictly_before_the_limit() {
-        // 100 ms apart with a 350 ms limit: the frames at 0, 100, 200 and
-        // 300 ms are inside, the one at 400 ms is the first past the limit.
-        let mut cut = DurationCut::new(350_000);
-        let data = stream(100_000);
-
-        let frame_len = data.len() / FRAMES as usize;
-        let kept = run(&mut cut, &data, frame_len * 2);
-
-        assert_eq!(kept.len(), 4 * frame_len);
-        assert_eq!(kept.len() % frame_len, 0, "the cut lands on a boundary");
-        assert!(cut.is_reached());
-    }
-
-    #[test]
-    fn cut_handles_the_limit_inside_one_chunk() {
-        // The same run, but the socket hands the whole stream over at once, so
-        // the cut has to stop in the middle of what it was given.
-        let mut cut = DurationCut::new(350_000);
-        let data = stream(100_000);
-
-        let frame_len = data.len() / FRAMES as usize;
-        let kept = run(&mut cut, &data, data.len());
-
-        assert_eq!(kept.len(), 4 * frame_len);
-        assert!(cut.is_reached());
-    }
-
-    #[test]
-    fn cut_without_a_reachable_limit_keeps_everything() {
-        // A limit far beyond the stream must never truncate it.
-        let mut cut = DurationCut::new(u64::MAX);
-        let data = stream(10_000);
-
-        let kept = run(&mut cut, &data, 4_096);
-
-        assert_eq!(kept, data);
-        assert!(!cut.is_reached());
-    }
-
-    #[test]
-    fn a_partial_tail_is_kept_only_when_the_deadline_ends_the_run() {
-        // A chunk may end in the middle of a frame. If the cut never fired, the
-        // deadline ended the run and the truncated tail is part of the capture.
-        let mut cut = DurationCut::new(1_000_000);
-        let data = stream(100_000);
-        let frame_len = data.len() / FRAMES as usize;
-
-        let partial = &data[..2 * frame_len + 10];
-        let kept = run(&mut cut, partial, partial.len());
-
-        assert_eq!(kept, partial);
-        assert!(!cut.is_reached());
-    }
-
-    #[test]
-    fn a_frame_split_by_a_chunk_boundary_may_be_dropped_whole() {
-        // Same limit, but the socket splits the last frame inside the run:
-        // its 10-byte start arrives with the frames before it and the rest
-        // with the next chunk. Neither piece may reach the file, because half
-        // a record is not a shorter record.
-        let mut cut = DurationCut::new(350_000);
-        let data = stream(100_000);
-        let frame_len = data.len() / FRAMES as usize;
-        // 4 whole frames plus the first 10 bytes of the fifth.
-        let chunks = 4 * frame_len + 10;
-
-        let kept = run(&mut cut, &data[..5 * frame_len - 10], chunks);
-
-        assert_eq!(kept.len(), 4 * frame_len);
-        assert_eq!(kept.len() % frame_len, 0, "the cut lands on a boundary");
-        assert!(cut.is_reached());
-    }
-}
 
 #[cfg(test)]
 mod tests {

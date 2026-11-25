@@ -9,6 +9,9 @@ Currently this is used for Wi-Fi CSI sensing.
 
 - **Rust** (`src/`):
   - `collection.rs` — records the raw CSI stream from an ESPectre device.
+  - `device.rs` — owns the RX device's traffic mode and target rate: reads
+    `GET /sensing`, refuses a capture in the wrong mode, and is the only place
+    that writes the mode (through `bin/device.rs`).
   - `decoder.rs` — parses and validates the V8 CSI records.
   - `saving.rs` — decodes a capture and exports timestamp, amplitude, and phase
     arrays to `.npz`.
@@ -21,7 +24,7 @@ Currently this is used for Wi-Fi CSI sensing.
   - `main.rs` — default binary; runs the collection module with its default
     settings.
   - `bin/collect.rs`, `bin/decode.rs`, `bin/save.rs`, `bin/visualize.rs`,
-    `bin/streaming.rs` — standalone CLIs for each module.
+    `bin/streaming.rs`, `bin/device.rs` — standalone CLIs for each module.
 - **Web** (`web/`): HTML5, CSS3, and Vanilla JavaScript with HTML Canvas 2D for
   interactive heatmap rendering.
 - **Samples** (`samples/`): a recorded V8 capture (`capture_v8.bin`) and the
@@ -95,7 +98,7 @@ fill in the password, then ESpectre returns the endpoint:
 ```
 Wi-Fi password (ESPECTRE_WIFI_PASSWORD is unset): 
 Improv provisioning completed.
-Device endpoint: http://192.168.12.253:62587/espectre/v1
+Device endpoint: http://192.168.12.144:62587/espectre/v1
 ```
 
 This is the device IP needed to run the application:
@@ -106,6 +109,9 @@ cargo run --bin decode -- samples/capture_v8.bin --quiet
 
 # Record with the default device and output (same as `cargo run`)
 cargo run --bin collect -- --ip 10.178.22.9 --output capture_v8.bin --pps 100 --duration 5
+
+# Read the device's traffic mode before capturing (changes nothing)
+cargo run --bin device -- --ip 192.168.12.144 --show
 
 # Inspect the capture (optional)
 cargo run --bin decode -- capture_v8.bin --quiet

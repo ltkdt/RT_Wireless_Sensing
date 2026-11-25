@@ -7,6 +7,7 @@ sử dụng dòng lệnh.
 | Mô-đun | Nguồn | Mục đích | Lệnh độc lập | Tài liệu |
 |---|---|---|---|---|
 | Thu thập | `src/collection.rs` | Truyền dòng CSI thô từ ESPectre vào tệp `.bin` | `cargo run --bin collect -- --help` | [collection.md](collection.md) |
+| Thiết bị | `src/device.rs` | Đọc (và chỉ đổi khi được yêu cầu) chế độ lưu lượng và tốc độ đích của thiết bị RX | `cargo run --bin device -- --show` | [device.md](device.md) |
 | Giải mã | `src/decoder.rs` | Phân tích và xác thực khung CSI V8 | `cargo run --bin decode -- capture_v8.bin` | [decoder.md](decoder.md) |
 | Lưu trữ | `src/saving.rs` | Xuất timestamp/biên độ/pha ra `.npz` | `cargo run --bin save -- capture_v8.bin` | [saving.md](saving.md) |
 | DSP | `src/dsp/` | Xử lý tín hiệu đồng bộ trên CSI đã giải mã (`CsiSignal`): chuẩn hóa, resample, lọc Hampel/biquad, FFT/STFT | — (chỉ thư viện) | [dsp.md](dsp.md) |

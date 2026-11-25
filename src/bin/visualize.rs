@@ -9,7 +9,7 @@
 //! cargo run --bin visualize -- capture_v8.bin --serve --port 8080
 //! ```
 
-use std::{env, path::PathBuf, process::ExitCode};
+use std::{env, path::PathBuf, process::ExitCode, time::Duration};
 
 use rt_wireless_sensing::collection::{NominalPpsSource, traffic_mode_from_filename};
 use rt_wireless_sensing::dsp::{InterpMethod, NormScheme};
@@ -34,6 +34,10 @@ options:
   --pps PPS          nominal packet rate used for the diagnostic slot grid
                      (default: measured effective rate, which shrinks the grid
                      exactly for the seconds that miss samples)
+  --duration DUR     slot span of the run the operator asked for, written as
+                     5, 5s, 500ms or 1m (default: the recorded span)
+                     the capture file is never truncated: records past this
+                     span stay in the payload and are reported as extra
   --no-dsp           skip the precomputed DSP view (resampled amplitude/phase)
                      to keep the payload small; the DSP toggle stays hidden
   --dsp-interp M     resampling interpolation: nearest | linear | cubic
@@ -56,6 +60,7 @@ struct Options {
     output: Option<PathBuf>,
     json_output: Option<PathBuf>,
     pps: Option<f64>,
+    duration: Option<Duration>,
     dsp: Option<DspOptions>,
     serve: bool,
     port: u16,
@@ -108,10 +113,11 @@ async fn main() -> ExitCode {
             capture_end: true,
             diagnostics: true,
             dsp: options.dsp,
-            // The file is the whole run: a `--duration` capture is cut at its
-            // limit when it is written, so the span is simply how far the
-            // records reach.
-            span_us: None,
+            // The capture keeps every record the run produced, and a fixed
+            // length run usually overshoots its deadline by a chunk, so the
+            // recorded span is not the span that was asked for. `--duration`
+            // declares it; without the flag the recorded span is used.
+            span_us: options.duration.map(|duration| duration.as_micros() as u64),
         },
     ) {
         Ok(data) => data,
@@ -195,6 +201,7 @@ where
     let mut output = None;
     let mut json_output = None;
     let mut pps = None;
+    let mut duration = None;
     let mut dsp = Some(DspOptions::default());
     let mut serve = false;
     let mut port = 8080;
@@ -227,6 +234,12 @@ where
                     return Err(format!("invalid pps: {val}"));
                 }
                 pps = Some(parsed);
+            }
+            "--duration" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--duration requires a value".to_string())?;
+                duration = Some(parse_duration(&val)?);
             }
             "--no-dsp" => dsp = None,
             "--dsp-interp" => {
@@ -303,12 +316,40 @@ where
         output,
         json_output,
         pps,
+        duration,
         dsp,
         serve,
         port,
         open,
         quiet,
     }))
+}
+
+/// Parse a duration such as `5`, `5s`, `500ms`, `2m`, or `1h`.
+///
+/// A bare number is interpreted in seconds; the grammar is the one `collect`
+/// accepts for its own `--duration`.
+fn parse_duration(text: &str) -> Result<Duration, String> {
+    let text = text.trim();
+    let (number, multiplier) = if let Some(n) = text.strip_suffix("ms") {
+        (n, 0.001)
+    } else if let Some(n) = text.strip_suffix('s') {
+        (n, 1.0)
+    } else if let Some(n) = text.strip_suffix('m') {
+        (n, 60.0)
+    } else if let Some(n) = text.strip_suffix('h') {
+        (n, 3600.0)
+    } else {
+        (text, 1.0)
+    };
+    let seconds = number
+        .parse::<f64>()
+        .map_err(|_| format!("--duration requires a number, got {text:?}"))?
+        * multiplier;
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err(format!("--duration must be positive, got {text:?}"));
+    }
+    Ok(Duration::from_secs_f64(seconds))
 }
 
 fn print_summary(data: &VisualizationData) {
@@ -321,6 +362,9 @@ fn print_summary(data: &VisualizationData) {
     println!("subcarriers  : {}", m.subcarriers);
     println!("start clock  : {} µs", m.start_time_us);
     println!("duration     : {:.3} s", m.duration_seconds);
+    if let Some(declared) = m.declared_span_seconds {
+        println!("declared span: {declared:.3} s (the run that was asked for)");
+    }
     println!("rate         : {:.2} frames/s", m.effective_pps);
     match m.nominal_pps {
         Some(pps) => println!("nominal pps  : {:.0}", pps),
@@ -344,6 +388,12 @@ fn print_summary(data: &VisualizationData) {
             "extra records: {} (a slot took more than one record)",
             summary.extra_records
         );
+        if diag.records_past_span > 0 {
+            println!(
+                "past span    : {} record(s) arrived after the declared span",
+                diag.records_past_span
+            );
+        }
     }
 }
 
@@ -411,6 +461,56 @@ mod tests {
         assert_eq!(options.port, 9090);
         assert!(options.open);
         assert!(options.quiet);
+    }
+
+    #[test]
+    fn duration_sets_the_slot_span() {
+        let ParsedArgs::Run(options) = parse(&["run.bin", "--duration", "5"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(options.duration, Some(Duration::from_secs(5)));
+
+        let ParsedArgs::Run(options) = parse(&["run.bin", "--duration", "500ms"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(options.duration, Some(Duration::from_millis(500)));
+
+        let ParsedArgs::Run(options) = parse(&["run.bin"]).unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(options.duration, None);
+    }
+
+    #[test]
+    fn rejects_bad_durations() {
+        assert!(parse(&["--duration"]).is_err());
+        assert!(parse(&["--duration", "zero"]).is_err());
+        assert!(parse(&["--duration", "0"]).is_err());
+        assert!(parse(&["--duration", "-5"]).is_err());
+    }
+
+    #[test]
+    fn duration_bounds_the_slot_grid() {
+        // 5 s at 100 PPS is 500 slots, whatever the recording span turned out
+        // to be: the deadline stops the reader, not the writer.
+        let bytes = std::fs::read(rt_wireless_sensing::fixtures::capture_v8()).expect("fixture");
+        let data = VisualizationData::from_bytes_with_options(
+            &bytes,
+            Some("capture_v8_internal.bin"),
+            VisualizationOptions {
+                nominal_pps: Some(100.0),
+                nominal_pps_source: Some(NominalPpsSource::Argument),
+                traffic_mode: None,
+                capture_end: true,
+                diagnostics: true,
+                dsp: None,
+                span_us: Some(5_000_000),
+            },
+        )
+        .expect("payload");
+        let summary = &data.diagnostics.expect("trace").summary;
+        assert_eq!(summary.total_slots, 500);
+        assert_eq!(summary.filled_slots + summary.empty_slots, 500);
     }
 
     #[test]

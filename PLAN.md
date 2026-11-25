@@ -866,7 +866,7 @@ No test may read `capture_v8.bin` for this feature; the existing files are unaff
 
 ## Docs (acceptance checklist)
 
-- [ ] `cargo test --all-targets` and `cargo clippy --all-targets` clean.
+- [x] `cargo test --all-targets` and `cargo clippy --all-targets` clean.
 - [ ] `--internal` appears in `collect --help`, `streaming --help` **and** `cargo run -- --help`.
 - [ ] **No binary sends `PATCH /sensing` during a capture.** Verified for both modes, by device
       log or proxy: `collect` and `streaming` issue `GET /capabilities`, `GET /sensing`,
@@ -897,10 +897,12 @@ No test may read `capture_v8.bin` for this feature; the existing files are unaff
       `traffic_mode`) render the current card with `—` and no layout jump, while
       `visualize capture_v8_internal.bin` shows `Traffic: Internal` and the relabelled
       `generator_missed` entry.
-- [ ] `README.md` carries the three-command switching flow (`--show`, `--mode ping` + `--internal`,
+- [x] `README.md` carries the three-command switching flow (`--show`, `--mode ping` + `--internal`,
       `--mode external` + `--pps 20`) plus the mode ↔ flag pairing table.
-- [ ] `docs_EN` and `docs_VN` both describe the mode, the read-only capture path and the `device`
-      binary; `Memory.md` §2.2/§2.6/§3 are updated.
+- [x] `docs_EN` and `docs_VN` both describe the mode, the read-only capture path and the `device`
+      binary, the `--duration` deadline and the `visualize --duration` slot span.
+- [x] `docs_EN/device.md` and `docs_VN/device.md` document the module itself, linked from the
+      module index in both languages.
 - [ ] `@espectre` `docs/ESpectre_sdk.md` exists (§10), and every claim in it cites a source
       (source line, `API.md`/`SDK.md`/`CSI.md` section, or this report).
 
@@ -911,7 +913,8 @@ Seven phases. Each ends with something that can be run or read, and phases are
 alters what an existing command does, and P5–P7 are additive. A phase may be reverted without
 reverting the ones before it.
 
-Progress: **P1 ✅ done · P2 ✅ done · P3 ✅ done · P4 ✅ done · P5 ✅ done** · P6–P7 pending.
+Progress: **P1 ✅ done · P2 ✅ done · P3 ✅ done · P4 ✅ done · P5 ✅ done · P7 ✅ done ·
+P8 ✅ done** · P6 pending (needs the device).
 
 ### P1 — `device` module (no behaviour change to any binary) — ✅ **IMPLEMENTED**
 
@@ -1265,12 +1268,50 @@ Deviations from the plan text, all deliberate:
 5. Wrong-mode stops: both directions, exit `3`, no file created.
 - **Exit criterion:** all five observed, recorded in `Memory.md`.
 
-### P7 — Documentation
+### P7 — Documentation — ✅ **IMPLEMENTED**
 
 1. `docs_EN` → `docs_VN` (collection, streaming, the new `device` binary) (§9).
 2. `README.md`: the three-command mode-switching flow (§11).
 3. `Memory.md`: the read-only decision and the pre-flight rule (§9).
 - **Exit criterion:** every claim in the plan's Docs checklist (§Docs) is ticked.
+
+**Status: done.** New `docs_EN/device.md` + `docs_VN/device.md` for the `device`
+module (the two-mode table, `DeviceStatus`, the `require_mode` matrix, the
+read-after-write rule, `DeviceError`, the `device` binary and its exit codes, and why
+the capture path never writes), indexed in both `docs_*/README.md`. `docs_EN`/`docs_VN`
+collection and visualization updated with the `--internal` mode, the `_internal`
+suffix, `WrongDeviceMode`, the new `CollectionSummary` fields, the `--duration` deadline
+semantics, `visualize --duration` and the `records_past_span` / `total_slots` slot
+semantics; `README.md` gains `device.rs`/`bin/device.rs` in the structure list, a
+`device --show` step in the quick start, and the corrected endpoint `192.168.12.144`.
+
+### P8 — `--duration` belongs to the visualization, not to the writer — ✅ **IMPLEMENTED**
+
+The `ce977ee` attempt cut the last frame out of the capture file so that a 5 s run at
+100 PPS would contain exactly 500 records. That was the wrong layer: it made the writer
+inspect frames it only has to copy, and it silently altered the recording.
+
+1. **Reverted** the collection-side cutting (`DurationCut`, frame inspection, its tests).
+   `max_duration` is a wall-clock deadline on the reader again: every chunk received is
+   written whole, so a 5 s run at 100 PPS writes ~501 records (`f22cad0`/`14ab9ed`
+   behaviour).
+2. **`visualize --duration DUR`** reuses the `collect` duration grammar and sets
+   `VisualizationOptions::span_us`, so `total_slots = round(span × slots_per_second)` is
+   500 for a 5 s run — the denominator describes the run that was *asked for* while the
+   file stays a faithful record of what arrived.
+3. **Round once:** `slots_in_span` is integer arithmetic with a single `+ 500_000`
+   rounding; the 2-dp rounding applies only to the displayed `duration_seconds`.
+4. **Records past the span are counted, not trimmed:** `DiagnosticTrace::records_past_span`
+   reports them, they stay in the grid, and `count_filled_slots` skips the slots outside
+   `total_slots` so coverage and denominator describe the same span.
+5. **Metadata** carries `declared_span_seconds`, so the payload says which span the slot
+   counts belong to.
+6. `--duration` is out of scope for `streaming`.
+
+- **Exit criterion met:** `capture_v8_internal.bin` at `--pps 100` reports
+  **455 filled / 501 total** with `past span: 1`, and **454 filled / 500 total** with
+  `--duration 5` — the one record at second 5 slot 0 is the record the smaller
+  denominator excludes.
 
 ### Not this project (recorded, not scheduled)
 
@@ -1289,8 +1330,8 @@ Deviations from the plan text, all deliberate:
 
 ```
 P1 ──┬─> P2                          (writer, independent of the capture path)
-     └─> P3 ──> P4 ──┬─> P5           (UI can land after the CLI, or later)
-                     └─> P6 ──> P7    (verify on hardware before documenting it)
+     └─> P3 ──> P4 ──> P5 ──> P8     (the `--duration` split, writer + visualizer)
+                     └─> P7          (docs written; P6, the hardware run, is still open)
 ```
 
 ## Open questions
